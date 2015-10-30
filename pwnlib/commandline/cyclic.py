@@ -1,7 +1,13 @@
 #!/usr/bin/env python2
-import argparse, string, sys
-from pwnlib.util import cyclic, packing
-from pwnlib.log import getLogger, install_default_handler
+import argparse
+import string
+import sys
+
+from pwnlib.log import getLogger
+from pwnlib.log import install_default_handler
+from pwnlib.util import cyclic
+from pwnlib.util import packing
+
 install_default_handler()
 
 log = getLogger('pwnlib.commandline.cyclic')
@@ -49,9 +55,9 @@ def main():
         pat = args.lookup
 
         if pat.startswith('0x'):
-            pat = packing.pack(int(pat[2:], 16), subsize*8, 'little', 'unsigned')
+            pat = packing.pack(int(pat[2:], 16), subsize*8, 'little', False)
         elif pat.isdigit():
-            pat = packing.pack(int(pat, 10), subsize*8, 'little', 'unsigned')
+            pat = packing.pack(int(pat, 10), subsize*8, 'little', False)
 
         if len(pat) != subsize:
             log.critical('Subpattern must be %d bytes' % subsize)
