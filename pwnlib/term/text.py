@@ -1,8 +1,10 @@
+from __future__ import absolute_import
+
 import functools
 import sys
 import types
 
-from . import termcap
+from pwnlib.term import termcap
 
 
 def eval_when(when):
@@ -13,7 +15,7 @@ def eval_when(when):
         elif when == 'never':
             return False
         elif when == 'auto':
-            return sys.stderr.isatty()
+            return sys.stdout.isatty()
         else:
             return when.isatty()
     else:

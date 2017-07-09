@@ -1,9 +1,8 @@
 <%
-  from pwnlib.shellcraft import thumb 
-  from pwnlib.context import context as ctx # Ugly hack, mako will not let it be called context
+  from pwnlib.shellcraft import thumb
+  from pwnlib.constants import eval
+  from pwnlib.abi import linux_arm_syscall as abi
 %>
-
-
 <%page args="syscall = None, arg0 = None, arg1 = None, arg2 = None, arg3 = None, arg4 = None, arg5 = None, arg6 = None"/>
 <%docstring>
 Args: [syscall_number, \*args]
@@ -19,14 +18,42 @@ Example:
         mov r1, sp
         mov r2, #2
         eor r3, r3
-        mov r7, #11
-        swi #1
+        mov r7, #0xb
+        svc 0x41
     >>> print shellcraft.thumb.linux.syscall('SYS_exit', 0).rstrip()
         /* call exit(0) */
-        movs r0, 1
-        subs r0, 1
-        mov r7, #SYS_exit
-        swi #1
+        eor r0, r0
+        mov r7, #SYS_exit /* 1 */
+        svc 0x41
+    >>> print pwnlib.shellcraft.open('/home/pwn/flag').rstrip() #doctest: +ELLIPSIS
+        /* open(file='/home/pwn/flag', oflag=0, mode=0) */
+        /* push '/home/pwn/flag\x00' */
+        mov r7, #(0x6761 >> 8)
+        lsl r7, #8
+        add r7, #(0x6761 & 0xff)
+        push {r7}
+        ldr r7, value_...
+        b value_..._after
+    value_...: .word 0x6c662f6e
+    value_..._after:
+        push {r7}
+        ldr r7, value_...
+        b value_..._after
+    value_...: .word 0x77702f65
+    value_..._after:
+        push {r7}
+        ldr r7, value_...
+        b value_..._after
+    value_...: .word 0x6d6f682f
+    value_..._after:
+        push {r7}
+        mov r0, sp
+        eor r1, r1
+        eor r2, r2
+        /* call open() */
+        mov r7, #SYS_open /* 5 */
+        svc 0x41
+
 </%docstring>
 <%
   if isinstance(syscall, (str, unicode)) and syscall.startswith('SYS_'):
@@ -47,11 +74,13 @@ Example:
   while args and args[-1] == '?':
       args.pop()
   syscall_repr = syscall_repr % ', '.join(args)
+
+  registers = abi.register_arguments
+  arguments = [syscall, arg0, arg1, arg2, arg3, arg4, arg5]
+  regctx    = dict(zip(registers, arguments))
 %>\
     /* call ${syscall_repr} */
-% for dst, src in zip(['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7'], [arg0, arg1, arg2, arg3, arg4, arg5, arg6, syscall]):
-  % if src != None:
-    ${thumb.mov(dst, src)}
-  % endif
-% endfor
-  swi #1
+%if any(arguments):
+    ${thumb.setregs(regctx)}
+%endif
+    svc 0x41

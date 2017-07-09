@@ -67,12 +67,12 @@ actually **interact** with processes.
 
 There's even an SSH module for when you've got to SSH into a box to perform
 a local/setuid exploit with :mod:`pwnlib.tubes.ssh`.  You can quickly spawn
-processes and grab the output, or spawn a process and interact iwth it like
+processes and grab the output, or spawn a process and interact with it like
 a ``process`` tube.
 
 ::
 
-    >>> shell = ssh('bandit0', 'bandit.labs.overthewire.org', password='bandit0')
+    >>> shell = ssh('bandit0', 'bandit.labs.overthewire.org', password='bandit0', port=2220)
     >>> shell['whoami']
     'bandit0'
     >>> shell.download_file('/etc/motd')
@@ -170,14 +170,14 @@ But if you do, it's easy to suss out!
        5:   eb f9                   jmp    0x0
 
 However, you shouldn't even need to write your own shellcode most of the
-time!  Pwntools comes with the :mod:`pwnlib.shellcraft` module, which is
+time!  pwntools comes with the :mod:`pwnlib.shellcraft` module, which is
 loaded with useful time-saving shellcodes.
 
 Let's say that we want to `setreuid(getuid(), getuid())` followed by `dup`ing
 file descriptor 4 to `stdin`, `stdout`, and `stderr`, and then pop a shell!
 
-    >>> asm(shellcraft.setreuid() + shellcraft.dupsh(4)).encode('hex')
-    '6a3158cd8089c389d96a4658cd806a045b6a0359496a3f58cd8075f86a68682f2f2f73682f62696e89e331c96a0b5899cd80'
+    >>> asm(shellcraft.setreuid() + shellcraft.dupsh(4)).encode('hex') # doctest: +ELLIPSIS
+    '6a3158cd80...'
 
 
 Misc Tools
@@ -212,8 +212,8 @@ Stop hard-coding things!  Look them up at runtime with :mod:`pwnlib.elf`.
 You can even patch and save the files.
 
     >>> e = ELF('/bin/cat')
-    >>> e.read(e.address+1, 3)
-    'ELF'
+    >>> e.read(e.address, 4)
+    '\x7fELF'
     >>> e.asm(e.address, 'ret')
     >>> e.save('/tmp/quiet-cat')
     >>> disasm(file('/tmp/quiet-cat','rb').read(1))

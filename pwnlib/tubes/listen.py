@@ -1,15 +1,17 @@
+from __future__ import absolute_import
+
 import errno
 import socket
 
-from ..context import context
-from ..log import getLogger
-from ..timeout import Timeout
-from .sock import sock
+from pwnlib.context import context
+from pwnlib.log import getLogger
+from pwnlib.timeout import Timeout
+from pwnlib.tubes.sock import sock
 
 log = getLogger(__name__)
 
 class listen(sock):
-    """Creates an TCP or UDP-socket to receive data on. It supports
+    r"""Creates an TCP or UDP-socket to receive data on. It supports
     both IPv4 and IPv6.
 
     The returned object supports all the methods from
@@ -17,40 +19,67 @@ class listen(sock):
 
     Arguments:
         port(int): The port to connect to.
+            Defaults to a port auto-selected by the operating system.
         bindaddr(str): The address to bind to.
+            Defaults to ``0.0.0.0`` / `::`.
         fam: The string "any", "ipv4" or "ipv6" or an integer to pass to :func:`socket.getaddrinfo`.
         typ: The string "tcp" or "udp" or an integer to pass to :func:`socket.getaddrinfo`.
-        timeout: A positive number, None
+
+    Examples:
+
+        >>> l = listen(1234)
+        >>> r = remote('localhost', l.lport)
+        >>> _ = l.wait_for_connection()
+        >>> l.sendline('Hello')
+        >>> r.recvline()
+        'Hello\n'
+
+        >>> l = listen()
+        >>> l.spawn_process('/bin/sh')
+        >>> r = remote('localhost', l.lport)
+        >>> r.sendline('echo Goodbye')
+        >>> r.recvline()
+        'Goodbye\n'
     """
 
+    #: Local port
+    lport = 0
+
+    #: Local host
+    lhost = None
+
+    #: Socket type (e.g. socket.SOCK_STREAM)
+    type = None
+
+    #: Socket family
+    family = None
+
+    #: Socket protocol
+    protocol = None
+
+    #: Canonical name of the listening interface
+    canonname = None
+
+    #: Sockaddr structure that is being listened on
+    sockaddr = None
+
+    _accepter = None
+
     def __init__(self, port=0, bindaddr = "0.0.0.0",
-                 fam = "any", typ = "tcp",
-                 timeout = Timeout.default):
-        super(listen, self).__init__(timeout)
+                 fam = "any", typ = "tcp", *args, **kwargs):
+        super(listen, self).__init__(*args, **kwargs)
 
         port = int(port)
+        fam  = {socket.AF_INET: 'ipv4',
+                socket.AF_INET6: 'ipv6'}.get(fam, fam)
 
-        if fam == 'any':
-            fam = socket.AF_UNSPEC
-        elif fam == 4 or fam.lower() in ['ipv4', 'ip4', 'v4', '4']:
-            fam = socket.AF_INET
-        elif fam == 6 or fam.lower() in ['ipv6', 'ip6', 'v6', '6']:
-            fam = socket.AF_INET6
-        elif isinstance(fam, (int, long)):
-            pass
-        else:
-            log.error("remote(): family %r is not supported" % fam)
+        fam = self._get_family(fam)
+        typ = self._get_type(typ)
 
-        if typ == "tcp":
-            typ = socket.SOCK_STREAM
-        elif typ == "udp":
-            typ = socket.SOCK_DGRAM
-        elif isinstance(typ, (int, long)):
-            pass
-        else:
-            log.error("remote(): type %r is not supported" % typ)
+        if fam == socket.AF_INET6 and bindaddr == '0.0.0.0':
+            bindaddr = '::'
 
-        h = log.waitfor('Trying to bind to %s on port %d' % (bindaddr, port))
+        h = self.waitfor('Trying to bind to %s on port %d' % (bindaddr, port))
 
         for res in socket.getaddrinfo(bindaddr, port, fam, typ, 0, socket.AI_PASSIVE):
             self.family, self.type, self.proto, self.canonname, self.sockaddr = res
@@ -68,11 +97,11 @@ class listen(sock):
             break
         else:
             h.failure()
-            log.error("Could not bind to %s on port %d" % (bindaddr, port))
+            self.error("Could not bind to %s on port %d" % (bindaddr, port))
 
         h.success()
 
-        h = log.waitfor('Waiting for connections on %s:%s' % (self.lhost, self.lport))
+        h = self.waitfor('Waiting for connections on %s:%s' % (self.lhost, self.lport))
 
         def accepter():
             while True:
@@ -81,16 +110,17 @@ class listen(sock):
                         self.sock, rhost = listen_sock.accept()
                         listen_sock.close()
                     else:
-                        self.buffer, rhost = listen_sock.recvfrom(4096)
+                        data, rhost = listen_sock.recvfrom(4096)
                         listen_sock.connect(rhost)
                         self.sock = listen_sock
+                        self.unrecv(data)
                     self.settimeout(self.timeout)
                     break
                 except socket.error as e:
                     if e.errno == errno.EINTR:
                         continue
                     h.failure()
-                    log.exception("Socket failure while waiting for connection")
+                    self.exception("Socket failure while waiting for connection")
                     self.sock = None
                     return
 
@@ -104,6 +134,7 @@ class listen(sock):
     def spawn_process(self, *args, **kwargs):
         def accepter():
             self.wait_for_connection()
+            self.sock.setblocking(1)
             p = super(listen, self).spawn_process(*args, **kwargs)
             p.wait()
             self.close()
@@ -118,8 +149,7 @@ class listen(sock):
 
     def __getattr__(self, key):
         if key == 'sock':
-            while self._accepter.is_alive():
-                self._accepter.join(timeout = 0.1)
+            self._accepter.join(timeout = self.timeout)
             if 'sock' in self.__dict__:
                 return self.sock
             else:
@@ -130,6 +160,6 @@ class listen(sock):
     def close(self):
         # since `close` is scheduled to run on exit we must check that we got
         # a connection or the program will hang in the `join` call above
-        if self._accepter.is_alive():
+        if self._accepter and self._accepter.is_alive():
             return
         super(listen, self).close()

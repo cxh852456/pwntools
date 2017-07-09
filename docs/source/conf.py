@@ -22,6 +22,8 @@ build_dash = tags.has('dash')
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('../..'))
 
+import pwnlib
+
 # -- General configuration -----------------------------------------------------
 
 # If your documentation needs a minimal Sphinx version, state it here.
@@ -42,21 +44,41 @@ extensions = [
     'sphinxcontrib.napoleon'
 ]
 
+# Napoleon settings
+napoleon_use_ivar = True
+napoleon_use_rtype = False
+
 doctest_global_setup = '''
-import pwnlib, sys
+import sys, os
+os.environ['PWNLIB_NOTERM'] = '1'
+os.environ['PWNLIB_RANDOMIZE'] = '0'
+import pwnlib
 pwnlib.context.context.reset_local()
 pwnlib.context.ContextType.defaults['log_level'] = 'ERROR'
+pwnlib.context.ContextType.defaults['randomize'] = False
+pwnlib.util.fiddling.default_style = {}
 pwnlib.term.text.when = 'never'
 pwnlib.log.install_default_handler()
-pwnlib.log.console.stream = sys.stdout
+pwnlib.log.rootlogger.setLevel(1)
+
+# Sphinx modifies sys.stdout, and context.log_terminal has
+# a reference to the original instance.  We need to update
+# it for logging to be captured.
+class stdout(object):
+    def __getattr__(self, name):
+        return getattr(sys.stdout, name)
+    def __setattr__(self, name, value):
+        return setattr(sys.stdout, name, value)
+pwnlib.context.ContextType.defaults['log_console'] = stdout()
 '''
 
-autodoc_member_order = 'alphabetical'
+autoclass_content = 'both'
+autodoc_member_order = 'groupwise' # 'alphabetical'
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
-doctest_test_doctest_blocks = True
+doctest_test_doctest_blocks = 'true'
 
 # The suffix of source filenames.
 source_suffix = '.rst'
@@ -69,14 +91,13 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'pwntools'
-copyright = u'2014, Gallopsled et al'
+copyright = u'2016, Gallopsled et al.'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
 # built documents.
 #
 # The short X.Y version.
-import pwnlib
 release = pwnlib.__version__
 version = release.rsplit('.', 1)[0]
 
@@ -212,11 +233,11 @@ latex_elements = {
 # (source start file, target name, title, author, documentclass [howto/manual]).
 latex_documents = [
   ('index', 'pwntools.tex', u'pwntools Documentation',
-   u'Gallopsled et al', 'manual'),
+   u'2016, Gallopsled et al.', 'manual'),
 ]
 
 intersphinx_mapping = {'python': ('https://docs.python.org/2.7', None),
-                       'paramiko': ('https://paramiko-docs.readthedocs.org/en/1.15/', None)}
+                       'paramiko': ('https://paramiko-docs.readthedocs.org/en/2.1/', None)}
 
 # The name of an image file (relative to this directory) to place at the top of
 # the title page.
@@ -245,7 +266,7 @@ intersphinx_mapping = {'python': ('https://docs.python.org/2.7', None),
 # (source start file, name, description, authors, manual section).
 man_pages = [
     ('index', 'pwntools', u'pwntools Documentation',
-     [u'Gallopsled et al'], 1)
+     [u'2016, Gallopsled et al.'], 1)
 ]
 
 # If true, show URL addresses after external links.
@@ -259,7 +280,7 @@ man_pages = [
 #  dir menu entry, description, category)
 texinfo_documents = [
   ('index', 'pwntools', u'pwntools Documentation',
-   u'Gallopsled et al', 'pwntools', 'One line description of project.',
+   u'', 'pwntools', 'CTF exploit writing toolkit.',
    'Miscellaneous'),
 ]
 
@@ -332,3 +353,50 @@ if build_dash:
         html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
     # otherwise, readthedocs.org uses their theme by default, so no need to specify it
+
+
+# -- Customization to Sphinx autodoc generation --------------------------------------------
+import sphinx.ext.autodoc
+from sphinx.util.inspect import safe_getmembers, safe_getattr
+
+# Test hidden members (e.g. def _foo(...))
+def dont_skip_any_doctests(app, what, name, obj, skip, options):
+    return False
+
+# Test non-exported members
+class ModuleDocumenter(sphinx.ext.autodoc.ModuleDocumenter):
+    def get_object_members(self, want_all):
+        if want_all:
+            # if not hasattr(self.object, '__all__'):
+            #     for implicit module members, check __module__ to avoid
+            #     documenting imported objects
+                return True, safe_getmembers(self.object)
+            # else:
+            #     memberlist = self.object.__all__
+            #     # Sometimes __all__ is broken...
+            #     if not isinstance(memberlist, (list, tuple)) or not \
+            #        all(isinstance(entry, string_types) for entry in memberlist):
+            #         self.directive.warn(
+            #             '__all__ should be a list of strings, not %r '
+            #             '(in module %s) -- ignoring __all__' %
+            #             (memberlist, self.fullname))
+            #         # fall back to all members
+            #         return True, safe_getmembers(self.object)
+        else:
+            memberlist = self.options.members or []
+        ret = []
+        for mname in memberlist:
+            try:
+                ret.append((mname, safe_getattr(self.object, mname)))
+            except AttributeError:
+                self.directive.warn(
+                    'missing attribute mentioned in :members: or __all__: '
+                    'module %s, attribute %s' % (
+                        safe_getattr(self.object, '__name__', '???'), mname))
+        return False, ret
+
+if 'doctest' in sys.argv:
+    def setup(app):
+        app.connect('autodoc-skip-member', dont_skip_any_doctests)
+
+    sphinx.ext.autodoc.ModuleDocumenter = ModuleDocumenter

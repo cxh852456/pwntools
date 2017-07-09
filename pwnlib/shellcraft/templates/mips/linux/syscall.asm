@@ -1,55 +1,112 @@
 <%
-  from pwnlib.shellcraft import mips
-  from pwnlib import constants
+  from pwnlib.shellcraft import mips, pretty
+  from pwnlib.constants import Constant
+  from pwnlib.abi import linux_mips_syscall as abi
 %>
-<%page args="syscall = None, arg0 = None, arg1 = None, arg2 = None, arg3 = None, arg4 = None, arg5 = None, arg6 = None"/>
+<%page args="syscall = None, arg0 = None, arg1 = None, arg2 = None, arg3 = None, arg4=None, arg5=None"/>
 <%docstring>
 Args: [syscall_number, \*args]
     Does a syscall
 
 Any of the arguments can be expressions to be evaluated by :func:`pwnlib.constants.eval`.
+
+Example:
+
+        >>> print pwnlib.shellcraft.mips.linux.syscall('SYS_execve', 1, '$sp', 2, 0).rstrip()
+            /* call execve(1, '$sp', 2, 0) */
+            li $t9, ~1
+            not $a0, $t9
+            add $a1, $sp, $0 /* mov $a1, $sp */
+            li $t9, ~2
+            not $a2, $t9
+            slti $a3, $zero, 0xFFFF /* $a3 = 0 */
+            ori $v0, $zero, SYS_execve
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.mips.linux.syscall('SYS_execve', 2, 1, 0, 20).rstrip()
+            /* call execve(2, 1, 0, 0x14) */
+            li $t9, ~2
+            not $a0, $t9
+            li $t9, ~1
+            not $a1, $t9
+            slti $a2, $zero, 0xFFFF /* $a2 = 0 */
+            li $t9, ~0x14
+            not $a3, $t9
+            ori $v0, $zero, SYS_execve
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.mips.linux.syscall().rstrip()
+            /* call syscall() */
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.mips.linux.syscall('$v0', '$a0', '$a1').rstrip()
+            /* call syscall('$v0', '$a0', '$a1') */
+            /* setregs noop */
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.mips.linux.syscall('$a3', None, None, 1).rstrip()
+            /* call syscall('$a3', ?, ?, 1) */
+            li $t9, ~1
+            not $a2, $t9
+            sw $a3, -4($sp) /* mov $v0, $a3 */
+            lw $v0, -4($sp)
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.mips.linux.syscall(
+        ...               'SYS_mmap2', 0, 0x1000,
+        ...               'PROT_READ | PROT_WRITE | PROT_EXEC',
+        ...               'MAP_PRIVATE | MAP_ANONYMOUS',
+        ...               -1, 0).rstrip()
+            /* call mmap2(0, 0x1000, 'PROT_READ | PROT_WRITE | PROT_EXEC', 'MAP_PRIVATE | MAP_ANONYMOUS', -1, 0) */
+            slti $a0, $zero, 0xFFFF /* $a0 = 0 */
+            li $t9, ~0x1000
+            not $a1, $t9
+            li $t9, ~(PROT_READ | PROT_WRITE | PROT_EXEC) /* 7 */
+            not $a2, $t9
+            ori $a3, $zero, (MAP_PRIVATE | MAP_ANONYMOUS)
+            ori $v0, $zero, SYS_mmap2
+            syscall 0x40404
+        >>> print pwnlib.shellcraft.open('/home/pwn/flag').rstrip()
+            /* open(file='/home/pwn/flag', oflag=0, mode=0) */
+            /* push '/home/pwn/flag\x00' */
+            li $t1, 0x6d6f682f
+            sw $t1, -16($sp)
+            li $t1, 0x77702f65
+            sw $t1, -12($sp)
+            li $t1, 0x6c662f6e
+            sw $t1, -8($sp)
+            ori $t1, $zero, 26465
+            sw $t1, -4($sp)
+            addiu $sp, $sp, -16
+            add $a0, $sp, $0 /* mov $a0, $sp */
+            slti $a1, $zero, 0xFFFF /* $a1 = 0 */
+            slti $a2, $zero, 0xFFFF /* $a2 = 0 */
+            /* call open() */
+            ori $v0, $zero, SYS_open
+            syscall 0x40404
 </%docstring>
 <%
-    if isinstance(syscall, (str, unicode)) and syscall.startswith('SYS_'):
-        syscall_repr = syscall[4:] + "(%s)"
-        args = []
-    else:
+  append_cdq = False
+  if isinstance(syscall, (str, unicode, Constant)) and str(syscall).startswith('SYS_'):
+      syscall_repr = str(syscall)[4:] + "(%s)"
+      args = []
+  else:
       syscall_repr = 'syscall(%s)'
       if syscall == None:
           args = ['?']
       else:
           args = [repr(syscall)]
 
-    for arg in [arg0, arg1, arg2, arg3, arg4, arg5, arg6]:
-        if arg == None:
-            args.append('?')
-        else:
-            args.append(repr(arg))
-    while args and args[-1] == '?':
-        args.pop()
-    syscall_repr = syscall_repr % ', '.join(args)
-    stack_regs = [arg4, arg5, arg6]
+  for arg in [arg0, arg1, arg2, arg3, arg4, arg5]:
+      if arg == None:
+          args.append('?')
+      else:
+          args.append(pretty(arg, False))
+  while args and args[-1] == '?':
+      args.pop()
+  syscall_repr = syscall_repr % ', '.join(args)
+
+  registers = abi.register_arguments
+  arguments = [syscall, arg0, arg1, arg2, arg3, arg4, arg5]
+  regctx    = dict(zip(registers, arguments))
 %>\
-/* call ${syscall_repr} */
-% if len(filter(lambda x: x is not None, stack_regs)) > 0:
-    /* Be able to restore stack */
-    sw $sp, -36($sp)
-
-    % for i in range(len(stack_regs)):
-        % if not stack_regs[i] is None:
-            ${mips.mov('$at', stack_regs[i])}
-            sw $at, ${-32 + 16 + i * 4}($sp)
-        % endif
-    % endfor
-    add $sp, $sp, -32
-% endif
-% for dst, src in zip(['$a0', '$a1', '$a2', '$a3', '$v0'], [arg0, arg1, arg2, arg3, syscall]):
-    % if src != None:
-        ${mips.mov(dst, src)}
-    % endif
-% endfor
-    syscall 0x42424
-% if len(filter(lambda x: x is not None, stack_regs)) > 0:
-
-    lw $sp, -4($sp)
-% endif
+    /* call ${syscall_repr} */
+%if any(a is not None for a in arguments):
+    ${mips.setregs(regctx)}
+%endif
+    syscall 0x40404

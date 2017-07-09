@@ -1,6 +1,18 @@
 """
 This module includes and extends the standard module :mod:`itertools`.
 """
+from __future__ import absolute_import
+
+import collections
+import copy
+import multiprocessing
+import operator
+import random
+import time
+from itertools import *
+
+from pwnlib.context import context
+from pwnlib.log import getLogger
 
 __all__ = [
     'bruteforce'                             ,
@@ -9,7 +21,6 @@ __all__ = [
     'consume'                                ,
     'cyclen'                                 ,
     'dotproduct'                             ,
-    'exp'                                    ,
     'flatten'                                ,
     'group'                                  ,
     'iter_except'                            ,
@@ -54,16 +65,7 @@ __all__ = [
     'tee'
 ]
 
-import collections
-import copy
-import multiprocessing
-import operator
-import random
-import time
-from itertools import *
 
-from ..context import *
-from ..log import getLogger
 
 log = getLogger(__name__)
 
@@ -179,11 +181,11 @@ def quantify(iterable, pred = bool):
     Arguments:
         iterable:  An iterable.
         pred:  A function that given an element from `iterable` returns either
-               ``True`` or ``False``.
+               :const:`True` or :const:`False`.
 
     Returns:
       The number of elements in `iterable` for which `pred` returns
-      ``True``.
+      :const:`True`.
 
     Examples:
       >>> quantify([1, 2, 3, 4], lambda x: x % 2 == 0)
@@ -730,27 +732,7 @@ def chained(func):
                 yield x
     return wrapper
 
-def exp(s, n):
-    """exp(s, n)
-
-    Generalization of exponentiation to iterators.  The expression ``exp(s, n)``
-    is simply a shorthand notation for ``product(*[s]*n)``.
-
-    Arguments:
-      s(iterable): The iterable to exponentiate.
-      n(int): The exponent.
-
-    Returns:
-      A generator of ``n``-tuples of elements in ``s``.
-
-    Example:
-      >>> list(exp((0, 1), 3))
-      [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1), (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]
-    """
-    return product(*[s]*n)
-
 def bruteforce(func, alphabet, length, method = 'upto', start = None, databag = None):
-
     """bruteforce(func, alphabet, length, method = 'upto', start = None)
 
     Bruteforce `func` to return :const:`True`.  `func` should take a string

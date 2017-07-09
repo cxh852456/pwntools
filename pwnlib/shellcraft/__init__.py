@@ -1,14 +1,19 @@
+from __future__ import absolute_import
+
 import os
 import re
 import sys
 from types import ModuleType
 
-from . import internal
-from .. import constants
-from ..context import context
+from pwnlib import constants
+from pwnlib.context import context
+from pwnlib.shellcraft import internal
+from pwnlib.util import packing
 
 
 class module(ModuleType):
+    _templates = []
+
     def __init__(self, name, directory):
         super(module, self).__init__(name)
 
@@ -32,6 +37,10 @@ class module(ModuleType):
         # Insert into the module list
         sys.modules[self.__name__] = self
 
+    def _get_source(self, template):
+        assert template in self.templates
+        return os.path.join(self._absdir, *template.split('.')) + '.asm'
+
     def __lazyinit__(self):
 
         # Create a dictionary of submodules
@@ -43,7 +52,7 @@ class module(ModuleType):
                 self._submodules[name] = module(self.__name__ + '.' + name, os.path.join(self._dir, name))
             elif os.path.isfile(path) and name != '__doc__' and name[0] != '.':
                 funcname, _ext = os.path.splitext(name)
-                if not re.match('^[a-zA-Z][a-zA-Z0-9_]*$', funcname):
+                if not re.match('^[a-zA-Z_][a-zA-Z0-9_]*$', funcname):
                     raise ValueError("found illegal filename, %r" % name)
                 self._shellcodes[funcname] = name
 
@@ -93,7 +102,7 @@ class module(ModuleType):
     def _context_modules(self):
         self.__lazyinit__ and self.__lazyinit__()
         for k, m in self._submodules.items():
-            if k in [context.arch, context.os]:
+            if k in [context.arch, context.os, 'syscalls']:
                 yield m
 
     def __shellcodes__(self):
@@ -103,24 +112,51 @@ class module(ModuleType):
             result.extend(m.__shellcodes__())
         return result
 
-    template_dir = os.path.join(os.path.dirname(__file__), 'templates')
-    templates    = []
+    @property
+    def templates(self):
+        if self._templates:
+            return self._templates
 
-    for root, subfolder, files in os.walk(template_dir):
-        for file in filter(lambda x: x.endswith('.asm'), files):
-            value = os.path.splitext(file)[0]
-            value = os.path.join(root, value)
-            value = value.replace(template_dir, '')
-            value = value.replace(os.path.sep, '.')
-            value = value.lstrip('.')
-            templates.append(value)
+        template_dir = os.path.join(os.path.dirname(__file__), 'templates')
+        templates    = []
 
-    templates = sorted(templates)
+        for root, _, files in os.walk(template_dir, followlinks=True):
+            for file in filter(lambda x: x.endswith('.asm'), files):
+                value = os.path.splitext(file)[0]
+                value = os.path.join(root, value)
+                value = value.replace(template_dir, '')
+                value = value.replace(os.path.sep, '.')
+                value = value.lstrip('.')
+                templates.append(value)
+
+        templates = sorted(templates)
+        self._templates = templates
+        return templates
 
     def eval(self, item):
+        if isinstance(item, (int,long)):
+            return item
         return constants.eval(item)
 
-    import registers
+    def pretty(self, n, comment=True):
+        if isinstance(n, str):
+            return repr(n)
+        if not isinstance(n, (int,long)):
+            return n
+        if isinstance(n, constants.Constant):
+            if comment: return '%s /* %s */' % (n,self.pretty(int(n)))
+            else:       return '%s (%s)'     % (n,self.pretty(int(n)))
+        elif abs(n) < 10:
+            return str(n)
+        else:
+            return hex(n)
+
+    def okay(self, s, *a, **kw):
+        if isinstance(s, int):
+            s = packing.pack(s, *a, **kw)
+        return '\0' not in s and '\n' not in s
+
+    from pwnlib.shellcraft import registers
 
 # To prevent garbage collection
 tether = sys.modules[__name__]

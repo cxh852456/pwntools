@@ -1,7 +1,9 @@
+from __future__ import absolute_import
+
 import os
 import re
 
-from . import readline
+from pwnlib.term import readline
 
 
 class Completer:
@@ -105,7 +107,7 @@ class PathCompleter(Completer):
         if os.path.isdir(dirname):
             try:
                 names = os.listdir(dirname)
-            except:
+            except Exception:
                 return
             names = [n for n in names if n.startswith(basename)]
             dirname = os.path.dirname(prefix)

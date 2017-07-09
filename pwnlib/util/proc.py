@@ -1,19 +1,17 @@
+from __future__ import absolute_import
+
 import errno
+import socket
 import time
 
-from .. import tubes
-from ..log import getLogger
+import psutil
 
-try:
-    import psutil
-    _ok_import = True
-except ImportError:
-    _ok_import = False
+from pwnlib import tubes
+from pwnlib.log import getLogger
 
 log = getLogger(__name__)
 
-if _ok_import:
-    all_pids = psutil.pids
+all_pids = psutil.pids
 
 def pidof(target):
     """pidof(target) -> int list
@@ -32,14 +30,27 @@ def pidof(target):
     Returns:
         A list of found PIDs.
     """
-    if isinstance(target, tubes.sock.sock):
+    if isinstance(target, tubes.ssh.ssh_channel):
+        return [target.pid]
+
+    elif isinstance(target, tubes.sock.sock):
          local  = target.sock.getsockname()
          remote = target.sock.getpeername()
 
-         def match(p):
+         def match(c):
              return (c.raddr, c.laddr, c.status) == (local, remote, 'ESTABLISHED')
 
          return [c.pid for c in psutil.net_connections() if match(c)]
+
+    elif isinstance(target, tuple):
+        host, port = target
+
+        host = socket.gethostbyname(host)
+
+        def match(c):
+            return c.raddr == (host, port)
+
+        return [c.pid for c in psutil.net_connections() if match(c)]
 
     elif isinstance(target, tubes.process.process):
          return [target.proc.pid]
@@ -61,16 +72,22 @@ def pid_by_name(name):
         True
     """
     def match(p):
-         if p.name() == name:
-             return True
-         try:
-             if p.exe() == name:
-                 return True
-         except:
-             pass
-         return False
+        if p.status() == 'zombie':
+            return False
+        if p.name() == name:
+            return True
+        try:
+            if p.exe() == name:
+                return True
+        except Exception:
+            pass
+        return False
 
-    return [p.pid for p in psutil.process_iter() if match(p)]
+    processes = (p for p in psutil.process_iter() if match(p))
+
+    processes = sorted(processes, key=lambda p: p.create_time())
+
+    return list(reversed([p.pid for p in processes]))
 
 def name(pid):
     """name(pid) -> str
@@ -82,7 +99,8 @@ def name(pid):
         Name of process as listed in ``/proc/<pid>/status``.
 
     Example:
-        >>> name(os.getpid()) == os.path.basename(sys.argv[0])
+        >>> pid = pidof('init')[0]
+        >>> name(pid) == 'init'
         True
     """
     return psutil.Process(pid).name()
@@ -99,7 +117,7 @@ def parent(pid):
     """
     try:
          return psutil.Process(pid).parent().pid
-    except:
+    except Exception:
          return 0
 
 def children(ppid):
@@ -284,56 +302,3 @@ def wait_for_debugger(pid):
         while tracer(pid) is None:
             time.sleep(0.01)
         l.success()
-
-if not _ok_import:
-    def _make_stub(func):
-        func.__doc__ = 'Stubbed out function, because psutil is not available.'
-        return func
-
-    @_make_stub
-    def all_pids():
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def pidof(target):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def pid_by_name(name):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def name(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def parent(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def children(ppid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def ancestors(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def descendants(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def exe(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def cwd(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def cmdline(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")
-
-    @_make_stub
-    def starttime(pid):
-        log.error("Called stubbed-out function. Get psutil to work on your platform, then come back.")

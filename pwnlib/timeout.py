@@ -54,6 +54,11 @@ class TimeoutDefault(object):
     def __repr__(self): return "pwnlib.timeout.Timeout.default"
     def __str__(self): return "<default timeout>"
 
+class Maximum(float):
+    def __repr__(self):
+        return 'pwnlib.timeout.maximum'
+maximum = Maximum(2**20)
+
 class Timeout(object):
     """
     Implements a basic class which has a timeout, and support for
@@ -62,7 +67,7 @@ class Timeout(object):
     Valid timeout values are:
 
     - ``Timeout.default`` use the global default value (``context.default``)
-    - ``Timeout.forever`` or ``None`` never time out
+    - ``Timeout.forever`` or :const:`None` never time out
     - Any positive float, indicates timeouts in seconds
 
     Example:
@@ -116,8 +121,7 @@ class Timeout(object):
     #: OSX does not permit setting socket timeouts to 2**22.
     #: Assume that if we receive a timeout of 2**21 or greater,
     #: that the value is effectively infinite.
-    maximum = float(2**20)
-
+    maximum = maximum
 
     def __init__(self, timeout=default):
         self._stop    = 0
@@ -177,8 +181,8 @@ class Timeout(object):
         calculated against the time when the scope was entered, in a
         countdown fashion.
 
-        If ``None`` is specified for ``timeout``, then the current
-        timeout is used is made.  This allows ``None`` to be specified
+        If :const:`None` is specified for ``timeout``, then the current
+        timeout is used is made.  This allows :const:`None` to be specified
         as a default argument with less complexity.
         """
         # Don't count down from infinity

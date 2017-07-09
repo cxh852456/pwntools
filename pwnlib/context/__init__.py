@@ -4,13 +4,37 @@
 Implements context management so that nested/scoped contexts and threaded
 contexts work properly and as expected.
 """
+from __future__ import absolute_import
+
 import collections
+import functools
 import logging
+import os
+import platform
+import socket
+import stat
 import string
+import subprocess
+import sys
 import threading
+import time
 
-from ..timeout import Timeout
+import socks
 
+from pwnlib.config import register_config
+from pwnlib.device import Device
+from pwnlib.timeout import Timeout
+
+__all__ = ['context', 'ContextType', 'Thread']
+
+_original_socket = socket.socket
+
+class _devnull(object):
+    name = None
+    def write(self, *a, **kw): pass
+    def read(self, *a, **kw):  return ''
+    def flush(self, *a, **kw): pass
+    def close(self, *a, **kw): pass
 
 class _defaultdict(dict):
     """
@@ -225,9 +249,10 @@ def _longest(d):
     as it ensures the most complete match will be found.
 
     >>> data = {'a': 1, 'bb': 2, 'ccc': 3}
-    >>> _longest(data) == data
+    >>> pwnlib.context._longest(data) == data
     True
-    >>> for i in _longest(data): print i
+    >>> for i in pwnlib.context._longest(data):
+    ...     print i
     ccc
     bb
     a
@@ -242,7 +267,7 @@ class ContextType(object):
     r"""
     Class for specifying information about the target machine.
     Intended for use as a pseudo-singleton through the global
-    variable ``pwnlib.context.context``, available via
+    variable :data:`.context`, available via
     ``from pwn import *`` as ``context``.
 
     The context is usually specified at the top of the Python file for clarity. ::
@@ -305,20 +330,33 @@ class ContextType(object):
 
     #: Default values for :class:`pwnlib.context.ContextType`
     defaults = {
+        'adb_host': 'localhost',
+        'adb_port': 5037,
         'arch': 'i386',
+        'aslr': True,
         'binary': None,
         'bits': 32,
+        'buffer_size': 4096,
+        'delete_corefiles': False,
+        'device': os.getenv('ANDROID_SERIAL', None) or None,
         'endian': 'little',
+        'kernel': None,
         'log_level': logging.INFO,
+        'log_file': _devnull(),
+        'log_console': sys.stdout,
+        'randomize': False,
+        'rename_corefiles': True,
         'newline': '\n',
+        'noptrace': False,
         'os': 'linux',
+        'proxy': None,
         'signed': False,
+        'terminal': tuple(),
         'timeout': Timeout.maximum,
-        'terminal': None,
     }
 
     #: Valid values for :meth:`pwnlib.context.ContextType.os`
-    oses = sorted(('linux','freebsd','windows'))
+    oses = sorted(('linux','freebsd','windows','cgc','android'))
 
     big_32    = {'endian': 'big', 'bits': 32}
     big_64    = {'endian': 'big', 'bits': 64}
@@ -440,7 +478,7 @@ class ContextType(object):
         v = sorted("%s = %r" % (k,v) for k,v in self._tls._current.items())
         return '%s(%s)' % (self.__class__.__name__, ', '.join(v))
 
-    def local(self, **kwargs):
+    def local(self, function=None, **kwargs):
         """local(**kwargs) -> context manager
 
         Create a context manager for use with the ``with`` statement.
@@ -479,16 +517,62 @@ class ContextType(object):
             def __exit__(a, *b, **c):
                 self._tls.pop()
 
+            def __call__(self, function, *a, **kw):
+                @functools.wraps(function)
+                def inner(*a, **kw):
+                    with self:
+                        return function(*a, **kw)
+                return inner
+
         return LocalContext()
 
-    def clear(self):
+    @property
+    def silent(self, function=None):
+        """Disable all non-error logging within the enclosed scope.
+        """
+        return self.local(function, log_level='error')
+
+    @property
+    def quiet(self, function=None):
+        """Disables all non-error logging within the enclosed scope,
+        *unless* the debugging level is set to 'debug' or lower."""
+        level = 'error'
+        if context.log_level <= logging.DEBUG:
+            level = None
+        return self.local(function, log_level=level)
+
+    def quietfunc(self, function):
+        """Similar to :attr:`quiet`, but wraps a whole function."""
+        @functools.wraps(function)
+        def wrapper(*a, **kw):
+            level = 'error'
+            if context.log_level <= logging.DEBUG:
+                level = None
+            with self.local(function, log_level=level):
+                return function(*a, **kw)
+        return wrapper
+
+
+    @property
+    def verbose(self):
+        """Enable all logging within the enclosed scope.
+        """
+        return self.local(log_level='debug')
+
+    def clear(self, *a, **kw):
         """
         Clears the contents of the context.
         All values are set to their defaults.
 
+        Arguments:
+
+            a: Arguments passed to ``update``
+            kw: Arguments passed to ``update``
+
         Examples:
 
             >>> # Default value
+            >>> context.clear()
             >>> context.arch == 'i386'
             True
             >>> context.arch = 'arm'
@@ -500,10 +584,27 @@ class ContextType(object):
         """
         self._tls._current.clear()
 
+        if a or kw:
+            self.update(*a, **kw)
+
+    @property
+    def native(self):
+        if context.os in ('android', 'cgc'):
+            return False
+
+        arch = context.arch
+        with context.local(arch = platform.machine()):
+            platform_arch = context.arch
+
+            if arch in ('i386', 'amd64') and platform_arch in ('i386', 'amd64'):
+                return True
+
+            return arch == platform_arch
+
     @_validator
     def arch(self, arch):
         """
-        Target machine architecture.
+        Target binary architecture.
 
         Allowed values are listed in :attr:`pwnlib.context.ContextType.architectures`.
 
@@ -565,17 +666,22 @@ class ContextType(object):
             >>> vars(context) == {'arch': 'powerpc64', 'bits': 64, 'endian': 'big'}
             True
         """
-
         # Lowercase
         arch = arch.lower()
 
-        # Attempt to perform convenience and legacy compatibility
-        # transformations.
+        # Attempt to perform convenience and legacy compatibility transformations.
         # We have to make sure that x86_64 appears before x86 for this to work correctly.
-        transform = [('ppc', 'powerpc'), ('x86_64', 'amd64'), ('x86', 'i386')]
+        transform = [('ppc64', 'powerpc64'),
+                     ('ppc', 'powerpc'),
+                     ('x86_64', 'amd64'),
+                     ('x86', 'i386'),
+                     ('i686', 'i386'),
+                     ('armeabi', 'arm'),
+                     ('arm64', 'aarch64')]
         for k, v in transform:
             if arch.startswith(k):
-                arch = arch.replace(k,v,1)
+                arch = v
+                break
 
         try:
             defaults = ContextType.architectures[arch]
@@ -587,6 +693,33 @@ class ContextType(object):
                 self._tls[k] = v
 
         return arch
+
+    @_validator
+    def aslr(self, aslr):
+        """
+        ASLR settings for new processes.
+
+        If :const:`False`, attempt to disable ASLR in all processes which are
+        created via ``personality`` (``setarch -R``) and ``setrlimit``
+        (``ulimit -s unlimited``).
+
+        The ``setarch`` changes are lost if a ``setuid`` binary is executed.
+        """
+        return bool(aslr)
+
+    @_validator
+    def kernel(self, arch):
+        """
+        Target machine's kernel architecture.
+
+        Usually, this is the same as ``arch``, except when
+        running a 32-bit binary on a 64-bit kernel (e.g. i386-on-amd64).
+
+        Even then, this doesn't matter much -- only when the the segment
+        registers need to be known
+        """
+        with context.local(arch=arch):
+            return context.arch
 
     @_validator
     def bits(self, bits):
@@ -633,15 +766,16 @@ class ContextType(object):
 
         """
         # Cyclic imports... sorry Idolf.
-        from ..elf     import ELF
+        from pwnlib.elf     import ELF
 
-        e = ELF(binary)
+        if not isinstance(binary, ELF):
+            binary = ELF(binary)
 
-        self.arch   = e.arch
-        self.bits   = e.bits
-        self.endian = e.endian
+        self.arch   = binary.arch
+        self.bits   = binary.bits
+        self.endian = binary.endian
 
-        return e
+        return binary
 
     @property
     def bytes(self):
@@ -665,7 +799,6 @@ class ContextType(object):
     @bytes.setter
     def bytes(self, value):
         self.bits = value*8
-
 
     @_validator
     def endian(self, endianness):
@@ -741,6 +874,88 @@ class ContextType(object):
         permitted = sorted(level_names)
         raise AttributeError('log_level must be an integer or one of %r' % permitted)
 
+    @_validator
+    def log_file(self, value):
+        r"""
+        Sets the target file for all logging output.
+
+        Works in a similar fashion to :attr:`log_level`.
+
+        Examples:
+
+
+            >>> context.log_file = 'foo.txt' #doctest: +ELLIPSIS
+            >>> log.debug('Hello!') #doctest: +ELLIPSIS
+            >>> with context.local(log_level='ERROR'): #doctest: +ELLIPSIS
+            ...     log.info('Hello again!')
+            >>> with context.local(log_file='bar.txt'):
+            ...     log.debug('Hello from bar!')
+            >>> log.info('Hello from foo!')
+            >>> file('foo.txt').readlines()[-3] #doctest: +ELLIPSIS
+            '...:DEBUG:...:Hello!\n'
+            >>> file('foo.txt').readlines()[-2] #doctest: +ELLIPSIS
+            '...:INFO:...:Hello again!\n'
+            >>> file('foo.txt').readlines()[-1] #doctest: +ELLIPSIS
+            '...:INFO:...:Hello from foo!\n'
+            >>> file('bar.txt').readlines()[-1] #doctest: +ELLIPSIS
+            '...:DEBUG:...:Hello from bar!\n'
+        """
+        if isinstance(value, (str,unicode)):
+            modes = ('w', 'wb', 'a', 'ab')
+            # check if mode was specified as "[value],[mode]"
+            if ',' not in value:
+                value += ',a'
+            filename, mode = value.rsplit(',', 1)
+            value = open(filename, mode)
+
+        elif not isinstance(value, (file)):
+            raise AttributeError('log_file must be a file')
+
+        # Is this the same file we already have open?
+        # If so, don't re-print the banner.
+        if self.log_file and not isinstance(self.log_file, _devnull):
+            a = os.fstat(value.fileno()).st_ino
+            b = os.fstat(self.log_file.fileno()).st_ino
+
+            if a == b:
+                return self.log_file
+
+        iso_8601 = '%Y-%m-%dT%H:%M:%S'
+        lines = [
+            '=' * 78,
+            ' Started at %s ' % time.strftime(iso_8601),
+            ' sys.argv = [',
+            ]
+        for arg in sys.argv:
+            lines.append('   %r,' % arg)
+        lines.append(' ]')
+        lines.append('=' * 78)
+        for line in lines:
+            value.write('=%-78s=\n' % line)
+        value.flush()
+        return value
+
+    @_validator
+    def log_console(self, stream):
+        """
+        Sets the default logging console target.
+
+        Examples:
+
+            >>> context.log_level = 'warn'
+            >>> log.warn("Hello")
+            [!] Hello
+            >>> context.log_console=open('/dev/null', 'w')
+            >>> log.warn("Hello")
+            >>> context.clear()
+        """
+        if isinstance(stream, str):
+            stream = open(stream, 'wt')
+        return stream
+
+    @property
+    def mask(self):
+        return (1 << self.bits) - 1
 
     @_validator
     def os(self, os):
@@ -757,16 +972,21 @@ class ContextType(object):
             >>> context.os = 'foobar' #doctest: +ELLIPSIS
             Traceback (most recent call last):
             ...
-            AttributeError: os must be one of ['freebsd', 'linux', 'windows']
+            AttributeError: os must be one of ['android', 'cgc', 'freebsd', 'linux', 'windows']
         """
         os = os.lower()
 
         if os not in ContextType.oses:
-            raise AttributeError("os must be one of %r" % sorted(ContextType.oses))
+            raise AttributeError("os must be one of %r" % ContextType.oses)
 
         return os
 
-
+    @_validator
+    def randomize(self, r):
+        """
+        Global flag that lots of things should be randomized.
+        """
+        return bool(r)
 
     @_validator
     def signed(self, signed):
@@ -775,7 +995,7 @@ class ContextType(object):
 
         Can be set to any non-string truthy value, or the specific string
         values ``'signed'`` or ``'unsigned'`` which are converted into
-        ``True`` and ``False`` correspondingly.
+        :const:`True` and :const:`False` correspondingly.
 
         Examples:
 
@@ -826,6 +1046,190 @@ class ContextType(object):
         if isinstance(value, (str, unicode)):
             return [value]
         return value
+
+    @property
+    def abi(self):
+        return self._abi
+
+    @_validator
+    def proxy(self, proxy):
+        """
+        Default proxy for all socket connections.
+
+        Accepts either a string (hostname or IP address) for a SOCKS5 proxy on
+        the default port, **or** a ``tuple`` passed to ``socks.set_default_proxy``,
+        e.g. ``(socks.SOCKS4, 'localhost', 1234)``.
+
+        >>> context.proxy = 'localhost' #doctest: +ELLIPSIS
+        >>> r=remote('google.com', 80)
+        Traceback (most recent call last):
+        ...
+        ProxyConnectionError: Error connecting to SOCKS5 proxy localhost:1080: [Errno 111] Connection refused
+
+        >>> context.proxy = None
+        >>> r=remote('google.com', 80, level='error')
+        """
+
+        if not proxy:
+            socket.socket = _original_socket
+            return None
+
+        if isinstance(proxy, str):
+            proxy = (socks.SOCKS5, proxy)
+
+        if not isinstance(proxy, collections.Iterable):
+            raise AttributeError('proxy must be a string hostname, or tuple of arguments for socks.set_default_proxy')
+
+        socks.set_default_proxy(*proxy)
+        socket.socket = socks.socksocket
+
+        return proxy
+
+    @_validator
+    def noptrace(self, value):
+        """Disable all actions which rely on ptrace.
+
+        This is useful for switching between local exploitation with a debugger,
+        and remote exploitation (without a debugger).
+
+        This option can be set with the ``NOPTRACE`` command-line argument.
+        """
+        return bool(value)
+
+
+    @_validator
+    def adb_host(self, value):
+        """Sets the target host which is used for ADB.
+
+        This is useful for Android exploitation.
+
+        The default value is inherited from ANDROID_ADB_SERVER_HOST, or set
+        to the default 'localhost'.
+        """
+        return str(value)
+
+
+    @_validator
+    def adb_port(self, value):
+        """Sets the target port which is used for ADB.
+
+        This is useful for Android exploitation.
+
+        The default value is inherited from ANDROID_ADB_SERVER_PORT, or set
+        to the default 5037.
+        """
+        return int(value)
+
+    @_validator
+    def device(self, device):
+        """Sets the device being operated on.
+        """
+        if isinstance(device, Device):
+            self.arch = device.arch or self.arch
+            self.bits = device.bits or self.bits
+            self.endian = device.endian or self.endian
+            self.os = device.os or self.os
+        elif isinstance(device, str):
+            device = Device(device)
+        elif device is not None:
+            raise AttributeError("device must be either a Device object or a serial number as a string")
+
+        return device
+
+    @property
+    def adb(self):
+        """Returns an argument array for connecting to adb.
+
+        Unless ``$ADB_PATH`` is set, uses the default ``adb`` binary in ``$PATH``.
+        """
+        ADB_PATH = os.environ.get('ADB_PATH', 'adb')
+
+        command = [ADB_PATH]
+
+        if self.adb_host != self.defaults['adb_host']:
+            command += ['-H', self.adb_host]
+
+        if self.adb_port != self.defaults['adb_port']:
+            command += ['-P', str(self.adb_port)]
+
+        if self.device:
+            command += ['-s', str(self.device)]
+
+        return command
+
+    @_validator
+    def buffer_size(self, size):
+        """Internal buffer size to use for :class:`pwnlib.tubes.tube.tube` objects.
+
+        This is not the maximum size of the buffer, but this is the amount of data
+        which is passed to each raw ``read`` syscall (or equivalent).
+        """
+        return int(size)
+
+    @property
+    def cache_dir(self):
+        """Directory used for caching data.
+
+        Note:
+            May be either a path string, or :const:`None`.
+
+        Example:
+
+            >>> cache_dir = context.cache_dir
+            >>> cache_dir is not None
+            True
+            >>> os.chmod(cache_dir, 0o000)
+            >>> context.cache_dir is None
+            True
+            >>> os.chmod(cache_dir, 0o755)
+            >>> cache_dir == context.cache_dir
+            True
+        """
+        home = os.path.expanduser('~')
+
+        if not os.access(home, os.W_OK):
+            return None
+
+        cache = os.path.join(home, '.pwntools-cache')
+
+        if not os.path.exists(cache):
+            try:
+                os.mkdir(cache)
+            except OSError:
+                return None
+
+        # Some wargames e.g. pwnable.kr have created dummy directories
+        # which cannot be modified by the user account (owned by root).
+        if not os.access(cache, os.W_OK):
+            return None
+
+        return cache
+
+    @_validator
+    def delete_corefiles(self, v):
+        """Whether pwntools automatically deletes corefiles after exiting.
+        This only affects corefiles accessed via :attr:`.process.corefile`.
+
+        Default value is ``False``.
+        """
+        return bool(v)
+
+    @_validator
+    def rename_corefiles(self, v):
+        """Whether pwntools automatically renames corefiles.
+
+        This is useful for two things:
+
+        - Prevent corefiles from being overwritten, if ``kernel.core_pattern``
+          is something simple like ``"core"``.
+        - Ensure corefiles are generated, if ``kernel.core_pattern`` uses ``apport``,
+          which refuses to overwrite any existing files.
+
+        This only affects corefiles accessed via :attr:`.process.corefile`.
+
+        Default value is ``True``.
+        """
+        return bool(v)
 
     #*************************************************************************
     #                               ALIASES
@@ -901,11 +1305,63 @@ class ContextType(object):
     Thread = Thread
 
 
-#: Global ``context`` object, used to store commonly-used pwntools settings.
+#: Global :class:`.ContextType` object, used to store commonly-used pwntools settings.
+#:
 #: In most cases, the context is used to infer default variables values.
-#: For example, :meth:`pwnlib.asm.asm` can take an ``os`` parameter as a
-#: keyword argument.  If it is not supplied, the ``os`` specified by
-#: ``context`` is used instead.
+#: For example, :func:`.asm` can take an ``arch`` parameter as a
+#: keyword argument.
+#:
+#: If it is not supplied, the ``arch`` specified by ``context`` is used instead.
+#:
 #: Consider it a shorthand to passing ``os=`` and ``arch=`` to every single
 #: function call.
 context = ContextType()
+
+# Inherit default ADB values
+if 'ANDROID_ADB_SERVER_HOST' in os.environ:
+    context.adb_host = os.environ.get('ANDROID_ADB_SERVER_HOST')
+
+if 'ANDROID_ADB_SERVER_PORT' in os.environ:
+    context.adb_port = int(os.getenv('ANDROID_ADB_SERVER_PORT'))
+
+def LocalContext(function):
+    """
+    Wraps the specified function on a context.local() block, using kwargs.
+
+    Example:
+
+        >>> context.clear()
+        >>> @LocalContext
+        ... def printArch():
+        ...     print(context.arch)
+        >>> printArch()
+        i386
+        >>> printArch(arch='arm')
+        arm
+    """
+    @functools.wraps(function)
+    def setter(*a, **kw):
+        # Fast path to skip adding a Context frame
+        if not kw:
+            return function(*a)
+
+        with context.local(**{k:kw.pop(k) for k,v in kw.items() if isinstance(getattr(ContextType, k, None), property)}):
+            return function(*a, **kw)
+    return setter
+
+# Read configuration options from the context section
+def update_context_defaults(section):
+    # Circular imports FTW!
+    from pwnlib.util import safeeval
+    from pwnlib.log import getLogger
+    log = getLogger(__name__)
+    for key, value in section.items():
+        if key not in ContextType.defaults:
+            log.warn("Unknown configuration option %r in section %r" % (key, 'context'))
+            continue
+        if isinstance(ContextType.defaults[key], (str, unicode, tuple)):
+            value = safeeval.expr(value)
+
+        ContextType.defaults[key] = value
+
+register_config('context', update_context_defaults)

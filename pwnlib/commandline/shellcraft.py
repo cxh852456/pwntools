@@ -1,24 +1,16 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
+
 import argparse
 import os
 import sys
 import types
 
+import pwnlib
+pwnlib.args.free_form = False
+
 from pwn import *
-
-from . import common
-
-r = text.red
-g = text.green
-b = text.blue
-
-banner = '\n'.join(['  ' + r('____') + '  ' + g('_') + '          ' + r('_') + ' ' + g('_') + '                 ' + b('__') + ' ' + r('_'),
-                    ' ' + r('/ ___|') + g('| |__') + '   ' + b('___') + r('| |') + ' ' + g('|') + ' ' + b('___') + ' ' + r('_ __') + ' ' + g('__ _') + ' ' + b('/ _|') + ' ' + r('|_'),
-                    ' ' + r('\___ \\') + g('| \'_ \\') + ' ' + b('/ _ \\') + ' ' + r('|') + ' ' + g('|') + b('/ __|') + ' ' + r('\'__/') + ' ' + g('_` |') + ' ' + b('|_') + r('| __|'),
-                    '  ' + r('___) |') + ' ' + g('| | |') + '  ' + b('__/') + ' ' + r('|') + ' ' + g('|') + ' ' + b('(__') + r('| |') + ' ' + g('| (_| |') + '  ' + b('_|') + ' ' + r('|_'),
-                    ' ' + r('|____/') + g('|_| |_|') + b('\\___|') + r('_|') + g('_|') + b('\\___|') + r('_|') + '  ' + g('\\__,_|') + b('_|') + '  ' + r('\\__|'),
-                    '\n'
-                    ])
+from pwnlib.commandline import common
 
 
 #  ____  _          _ _                 __ _
@@ -37,9 +29,10 @@ def _string(s):
             out.append('\\x%02x' % co)
     return '"' + ''.join(out) + '"\n'
 
-p = argparse.ArgumentParser(
-    description = 'Microwave shellcode -- Easy, fast and delicious',
-    formatter_class = argparse.RawDescriptionHelpFormatter,
+
+p = common.parser_commands.add_parser(
+    'shellcraft',
+    help = 'Microwave shellcode -- Easy, fast and delicious',
 )
 
 
@@ -67,20 +60,19 @@ p.add_argument(
                'a', 'asm', 'assembly',
                'p',
                'i', 'hexii',
+               'e', 'elf',
+               'd', 'escaped',
                'default'],
     default = 'default',
-    help = 'Output format (default: hex), choose from {r}aw, {s}tring, {c}-style array, {h}ex string, hex{i}i, {a}ssembly code, {p}reprocssed code',
+    help = 'Output format (default: hex), choose from {e}lf, {r}aw, {s}tring, {c}-style array, {h}ex string, hex{i}i, {a}ssembly code, {p}reprocssed code, escape{d} hex string',
 )
 
 p.add_argument(
     'shellcode',
     nargs = '?',
-    choices = shellcraft.templates,
-    metavar = 'shellcode',
     help = 'The shellcode you want',
+    type = str
 )
-
-p.epilog = 'Available shellcodes are:\n' + '\n'.join(shellcraft.templates)
 
 p.add_argument(
     'args',
@@ -97,25 +89,111 @@ p.add_argument(
     action='store_true'
 )
 
-def main():
-    # Banner must be added here so that it doesn't appear in the autodoc
-    # generation for command line tools
-    p.description = banner + p.description
-    args = p.parse_args()
+p.add_argument(
+    '-b',
+    '--before',
+    help='Insert a debug trap before the code',
+    action='store_true'
+)
 
-    if not args.shellcode:
-        print '\n'.join(shellcraft.templates)
+p.add_argument(
+    '-a',
+    '--after',
+    help='Insert a debug trap after the code',
+    action='store_true'
+)
+
+p.add_argument(
+    '-v', '--avoid',
+    action='append',
+    help = 'Encode the shellcode to avoid the listed bytes'
+)
+
+p.add_argument(
+    '-n', '--newline',
+    dest='avoid',
+    action='append_const',
+    const='\n',
+    help = 'Encode the shellcode to avoid newlines'
+)
+
+p.add_argument(
+    '-z', '--zero',
+    dest='avoid',
+    action='append_const',
+    const='\x00',
+    help = 'Encode the shellcode to avoid NULL bytes'
+)
+
+p.add_argument(
+    '-r',
+    '--run',
+    help="Run output",
+    action='store_true'
+)
+
+p.add_argument(
+    '--color',
+    help="Color output",
+    action='store_true',
+    default=sys.stdout.isatty()
+)
+
+p.add_argument(
+    '--no-color',
+    help="Disable color output",
+    action='store_false',
+    dest='color'
+)
+
+p.add_argument(
+    '--syscalls',
+    help="List syscalls",
+    action='store_true'
+)
+
+p.add_argument(
+    '--address',
+    help="Load address",
+    default=None
+)
+
+p.add_argument(
+    '-l', '--list',
+    action='store_true',
+    help='List available shellcodes, optionally provide a filter'
+)
+
+def get_template(name):
+    func = shellcraft
+    for attr in name.split('.'):
+        func = getattr(func, attr)
+    return func
+
+def is_not_a_syscall_template(name):
+    template_src = shellcraft._get_source(name)
+    return '/syscalls' not in template_src
+
+def main(args):
+    if args.list:
+        templates = shellcraft.templates
+
+        if args.shellcode:
+            templates = filter(lambda a: args.shellcode in a, templates)
+        elif not args.syscalls:
+            templates = filter(is_not_a_syscall_template, templates)
+
+        print '\n'.join(templates)
         exit()
 
-    if args.format == 'default':
-        if sys.stdout.isatty():
-            args.format = 'hex'
-        else:
-            args.format = 'raw'
+    if not args.shellcode:
+        common.parser.print_usage()
+        exit()
 
-    func = shellcraft
-    for attr in args.shellcode.split('.'):
-        func = getattr(func, attr)
+    if args.shellcode not in shellcraft.templates:
+        log.error("Unknown shellcraft template %r. Use --list to see available shellcodes." % args.shellcode)
+
+    func = get_template(args.shellcode)
 
     if args.show:
         # remove doctests
@@ -184,18 +262,67 @@ def main():
     map(common.context_arg, args.shellcode.split('.'))
     code = func(*args.args)
 
+
+    if args.before:
+        code = shellcraft.trap() + code
+    if args.after:
+        code = code + shellcraft.trap()
+
+
     if args.format in ['a', 'asm', 'assembly']:
+        if args.color:
+            from pygments import highlight
+            from pygments.formatters import TerminalFormatter
+            from pwnlib.lexer import PwntoolsLexer
+
+            code = highlight(code, PwntoolsLexer(), TerminalFormatter())
+
         print code
         exit()
     if args.format == 'p':
         print cpp(code)
         exit()
 
-    code = asm(code)
+    assembly = code
+
+    vma = args.address
+    if vma:
+        vma = eval(vma)
+
+    if args.format in ['e','elf']:
+        args.format = 'default'
+        try: os.fchmod(args.out.fileno(), 0700)
+        except OSError: pass
+
+
+        if not args.avoid:
+            code = read(make_elf_from_assembly(assembly, vma=vma))
+        else:
+            code = asm(assembly)
+            code = encode(code, args.avoid)
+            code = make_elf(code, vma=vma)
+            # code = read(make_elf(encode(asm(code), args.avoid)))
+    else:
+        code = encode(asm(assembly), args.avoid)
+
+    if args.format == 'default':
+        if args.out.isatty():
+            args.format = 'hex'
+        else:
+            args.format = 'raw'
+
+    arch = args.shellcode.split('.')[0]
 
     if args.debug:
-        arch = args.shellcode.split('.')[0]
-        proc = gdb.debug_shellcode(code, arch=arch)
+        if not args.avoid:
+            proc = gdb.debug_assembly(assembly, arch=arch, vma=vma)
+        else:
+            proc = gdb.debug_shellcode(code, arch=arch, vma=vma)
+        proc.interactive()
+        sys.exit(0)
+
+    if args.run:
+        proc = run_shellcode(code, arch=arch)
         proc.interactive()
         sys.exit(0)
 
@@ -207,10 +334,12 @@ def main():
         code = pwnlib.util.fiddling.enhex(code) + '\n'
     elif args.format in ['i', 'hexii']:
         code = hexii(code) + '\n'
-
+    elif args.format in ['d', 'escaped']:
+        code = ''.join('\\x%02x' % ord(c) for c in code) + '\n'
     if not sys.stdin.isatty():
-        sys.stdout.write(sys.stdin.read())
+        args.out.write(sys.stdin.read())
 
-    sys.stdout.write(code)
+    args.out.write(code)
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    pwnlib.commandline.common.main(__file__)

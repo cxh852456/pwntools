@@ -1,184 +1,565 @@
+# -*- coding: utf-8 -*-
+"""
+During exploit development, it is frequently useful to debug the
+target binary under GDB.
+
+Pwntools makes this easy-to-do with a handful of helper routines, designed
+to make your exploit-debug-update cycles much faster.
+
+Useful Functions
+----------------
+
+- :func:`attach` - Attach to an existing process
+- :func:`debug` - Start a new process under a debugger, stopped at the first instruction
+- :func:`debug_shellcode` - Build a binary with the provided shellcode, and start it under a debugger
+
+Debugging Tips
+--------------
+
+The :func:`attach` and :func:`debug` functions will likely be your bread and
+butter for debugging.
+
+Both allow you to provide a script to pass to GDB when it is started, so that
+it can automatically set your breakpoints.
+
+Attaching to Processes
+~~~~~~~~~~~~~~~~~~~~~~
+
+To attach to an existing process, just use :func:`attach`.  It is surprisingly
+versatile, and can attach to a :class:`.process` for simple
+binaries, or will automatically find the correct process to attach to for a
+forking server, if given a :class:`.remote` object.
+
+Spawning New Processes
+~~~~~~~~~~~~~~~~~~~~~~
+
+Attaching to processes with :func:`attach` is useful, but the state the process
+is in may vary.  If you need to attach to a process very early, and debug it from
+the very first instruction (or even the start of ``main``), you instead should use
+:func:`debug`.
+
+When you use :func:`debug`, the return value is a :class:`.tube` object
+that you interact with exactly like normal.
+
+Tips and Troubleshooting
+------------------------
+
+``NOPTRACE`` magic argument
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It's quite cumbersom to comment and un-comment lines containing `attach`.
+
+You can cause these lines to be a no-op by running your script with the
+``NOPTRACE`` argument appended, or with ``PWNLIB_NOPTRACE=1`` in the environment.
+
+::
+
+    $ python exploit.py NOPTRACE
+    [+] Starting local process '/bin/bash': Done
+    [!] Skipping debug attach since context.noptrace==True
+    ...
+
+Kernel Yama ptrace_scope
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Linux kernel v3.4 introduced a security mechanism called ``ptrace_scope``,
+which is intended to prevent processes from debugging eachother unless there is
+a direct parent-child relationship.
+
+This causes some issues with the normal Pwntools workflow, since the process
+heirarchy looks like this:
+
+::
+
+    python ---> target
+           `--> gdb
+
+Note that ``python`` is the parent of ``target``, not ``gdb``.
+
+In order to avoid this being a problem, Pwntools uses the function
+``prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)``.  This disables Yama
+for any processes launched by Pwntools via :class:`.process` or via
+:meth:`.ssh.process`.
+
+Older versions of Pwntools did not perform the ``prctl`` step, and
+required that the Yama security feature was disabled systemwide, which
+requires ``root`` access.
+
+Member Documentation
+===============================
+"""
+from __future__ import absolute_import
+
 import os
 import random
 import re
 import shlex
 import tempfile
+import time
 
-from . import atexit
-from . import elf
-from . import tubes
-from .asm import make_elf
-from .context import context
-from .log import getLogger
-from .util import misc
-from .util import proc
+from pwnlib import adb
+from pwnlib import atexit
+from pwnlib import elf
+from pwnlib import tubes
+from pwnlib.asm import _bfdname
+from pwnlib.asm import make_elf
+from pwnlib.asm import make_elf_from_assembly
+from pwnlib.context import LocalContext
+from pwnlib.context import context
+from pwnlib.log import getLogger
+from pwnlib.qemu import get_qemu_user
+from pwnlib.util import misc
+from pwnlib.util import proc
 
 log = getLogger(__name__)
 
-def debug_shellcode(data, execute=None, **kwargs):
+@LocalContext
+def debug_assembly(asm, gdbscript=None, vma=None):
+    """debug_assembly(asm, gdbscript=None, vma=None) -> tube
+
+    Creates an ELF file, and launches it under a debugger.
+
+    This is identical to debug_shellcode, except that
+    any defined symbols are available in GDB, and it
+    saves you the explicit call to asm().
+
+    Arguments:
+        asm(str): Assembly code to debug
+        gdbscript(str): Script to run in GDB
+        vma(int): Base address to load the shellcode at
+        **kwargs: Override any :obj:`.context` values.
+
+    Returns:
+        :class:`.process`
     """
-    Creates an ELF file, and launches it with GDB.
+    tmp_elf = make_elf_from_assembly(asm, vma=vma, extract=False)
+    os.chmod(tmp_elf, 0777)
+
+    atexit.register(lambda: os.unlink(tmp_elf))
+
+    if context.os == 'android':
+        android_path = '/data/data/%s' % os.path.basename(tmp_elf)
+        adb.push(tmp_elf, android_path)
+        tmp_elf = android_path
+
+    return debug(tmp_elf, gdbscript=gdbscript, arch=context.arch)
+
+@LocalContext
+def debug_shellcode(data, gdbscript=None, vma=None):
+    """
+    Creates an ELF file, and launches it under a debugger.
 
     Arguments:
         data(str): Assembled shellcode bytes
-        kwargs(dict): Arguments passed to context (e.g. arch='arm')
+        gdbscript(str): Script to run in GDB
+        vma(int): Base address to load the shellcode at
+        **kwargs: Override any :obj:`.context` values.
 
     Returns:
-        A ``process`` tube connected to the shellcode on stdin/stdout/stderr.
+        :class:`.process`
     """
-    with context.local(**kwargs):
-        tmp_elf  = tempfile.mktemp(prefix='pwn', suffix='.elf')
-        elf_data = make_elf(data)
-        with open(tmp_elf,'wb+') as f:
-            f.write(elf_data)
-            f.flush()
-        os.chmod(tmp_elf, 0777)
-        atexit.register(lambda: os.unlink(tmp_elf))
-        return debug(tmp_elf, execute=None, arch=context.arch)
+    if isinstance(data, unicode):
+        log.error("Shellcode is cannot be unicode.  Did you mean debug_assembly?")
+    tmp_elf = make_elf(data, extract=False, vma=vma)
+    os.chmod(tmp_elf, 0777)
 
-def get_qemu_arch(arch):
-    if arch == 'mips' and context.endian == 'little':
-        return 'mipsel'
-    if arch == 'arm' and context.endian == 'big':
-        return 'armeb'
-    if arch == 'amd64':
-        return 'x86_64'
+    atexit.register(lambda: os.unlink(tmp_elf))
 
-    arch = arch.replace('powerpc', 'ppc')
+    if context.os == 'android':
+        android_path = '/data/data/%s' % os.path.basename(tmp_elf)
+        adb.push(tmp_elf, android_path)
+        tmp_elf = android_path
 
-    return arch
+    return debug(tmp_elf, gdbscript=gdbscript, arch=context.arch)
 
-def debug(args, exe=None, execute=None, ssh=None, arch=None):
+def _gdbserver_args(pid=None, path=None, args=None, which=None):
+    """_gdbserver_args(pid=None, path=None) -> list
+
+    Sets up a listening gdbserver, to either connect to the specified
+    PID, or launch the specified binary by its full path.
+
+    Arguments:
+        pid(int): Process ID to attach to
+        path(str): Process to launch
+        args(list): List of arguments to provide on the debugger command line
+        which(callaable): Function to find the path of a binary.
+
+    Returns:
+        A list of arguments to invoke gdbserver.
+    """
+    if [pid, path, args].count(None) != 2:
+        log.error("Must specify exactly one of pid, path, or args")
+
+    if not which:
+        log.error("Must specify which.")
+
+    gdbserver = ''
+
+    if not args:
+        args = [str(path or pid)]
+
+    # Android targets have a distinct gdbserver
+    if context.bits == 64:
+        gdbserver = which('gdbserver64')
+
+    if not gdbserver:
+        gdbserver = which('gdbserver')
+
+    if not gdbserver:
+        log.error("gdbserver is not installed")
+
+    orig_args = args
+
+    gdbserver_args = [gdbserver]
+    if context.aslr:
+        gdbserver_args += ['--no-disable-randomization']
+    else:
+        log.warn_once("Debugging process with ASLR disabled")
+
+    if pid:
+        gdbserver_args += ['--once', '--attach']
+
+    gdbserver_args += ['localhost:0']
+    gdbserver_args += args
+
+    return gdbserver_args
+
+def _gdbserver_port(gdbserver, ssh):
+    which = _get_which(ssh)
+
+    # Process /bin/bash created; pid = 14366
+    # Listening on port 34816
+    process_created = gdbserver.recvline()
+    gdbserver.pid   = int(process_created.split()[-1], 0)
+
+    listening_on = ''
+    while 'Listening' not in listening_on:
+        listening_on    = gdbserver.recvline()
+
+    port = int(listening_on.split()[-1])
+
+    # Set up port forarding for SSH
+    if ssh:
+        remote   = ssh.connect_remote('127.0.0.1', port)
+        listener = tubes.listen.listen(0)
+        port     = listener.lport
+
+        # Disable showing GDB traffic when debugging verbosity is increased
+        remote.level = 'error'
+        listener.level = 'error'
+
+        # Hook them up
+        remote <> listener
+
+    # Set up port forwarding for ADB
+    elif context.os == 'android':
+        adb.forward(port)
+
+    return port
+
+def _get_which(ssh=None):
+    if ssh:                        return ssh.which
+    elif context.os == 'android':  return adb.which
+    else:                          return misc.which
+
+def _get_runner(ssh=None):
+    if ssh:                        return ssh.process
+    elif context.os == 'android':  return adb.process
+    else:                          return tubes.process.process
+
+@LocalContext
+def debug(args, gdbscript=None, exe=None, ssh=None, env=None, **kwargs):
     """debug(args) -> tube
 
     Launch a GDB server with the specified command line,
     and launches GDB to attach to it.
 
     Arguments:
-        args: Same args as passed to pwnlib.tubes.process
-        ssh: Remote ssh session to use to launch the process.
-          Automatically sets up port forwarding so that gdb runs locally.
+        args(list): Arguments to the process, similar to :class:`.process`.
+        gdbscript(str): GDB script to run.
+        exe(str): Path to the executable on disk
+        env(dict): Environment to start the binary in
+        ssh(:class:`.ssh`): Remote ssh session to use to launch the process.
 
     Returns:
-        A tube connected to the target process
+        :class:`.process` or :class:`.ssh_channel`: A tube connected to the target process
+
+    Notes:
+
+        The debugger is attached automatically, and you can debug everything
+        from the very beginning.  This requires that both ``gdb`` and ``gdbserver``
+        are installed on your machine.
+
+        .. code-block:: python
+
+            # Create a new process, and stop it at 'main'
+            io = gdb.debug('bash', '''
+            break main
+            continue
+            ''')
+
+        When GDB opens via :func:`debug`, it will initially be stopped on the very first
+        instruction of the dynamic linker (``ld.so``) for dynamically-linked binaries.
+
+        Only the target binary and the linker will be loaded in memory, so you cannot
+        set breakpoints on shared library routines like ``malloc`` since ``libc.so``
+        has not even been loaded yet.
+
+        There are several ways to handle this:
+
+        1. Set a breakpoint on the executable's entry point (generally, ``_start``)
+            - This is only invoked after all of the required shared libraries
+              are loaded.
+            - You can generally get the address via the GDB command ``info file``.
+        2. Use pending breakpoints via ``set breakpoint pending on``
+            - This has the side-effect of setting breakpoints for **every** function
+              which matches the name.  For ``malloc``, this will generally set a
+              breakpoint in the executable's PLT, in the linker's internal ``malloc``,
+              and eventaully in ``libc``'s malloc.
+        3. Wait for libraries to be loaded with ``set stop-on-solib-event 1``
+            - There is no way to stop on any specific library being loaded, and sometimes
+              multiple libraries are loaded and only a single breakpoint is issued.
+            - Generally, you just add a few ``continue`` commands until things are set up
+              the way you want it to be.
+
+        .. code-block:: python
+
+            # Create a new process, and stop it at 'main'
+            io = gdb.debug('bash', '''
+            # Wait until we hit the main executable's entry point
+            break _start
+            continue
+
+            # Now set breakpoint on shared library routines
+            break malloc
+            break free
+            continue
+            ''')
+
+        You can use :func:`debug` to spawn new processes on remote machines as well,
+        by using the ``ssh=`` keyword to pass in your :class:`.ssh` instance.
+
+        .. code-block:: python
+
+            # Connect to the SSH server
+            shell = ssh('passcode', 'pwnable.kr', 2222, password='guest')
+
+            # Start a process on the server
+            bash = gdb.debug(['bash'],
+                            ssh=shell,
+                            gdbscript='''
+            break main
+            continue
+            ''')
     """
+    if isinstance(args, (int, tubes.process.process, tubes.ssh.ssh_channel)):
+        log.error("Use gdb.attach() to debug a running process")
+
+    if env is None:
+        env = os.environ
+
     if isinstance(args, (str, unicode)):
         args = [args]
 
     orig_args = args
 
-    if not arch:
-        args = ['gdbserver', 'localhost:0'] + args
+    runner = _get_runner(ssh)
+    which  = _get_which(ssh)
+
+    if context.noptrace:
+        log.warn_once("Skipping debugger since context.noptrace==True")
+        return runner(args, executable=exe, env=env)
+
+    if ssh or context.native or (context.os == 'android'):
+        args = _gdbserver_args(args=args, which=which)
     else:
         qemu_port = random.randint(1024, 65535)
-        qemu_arch = get_qemu_arch(arch)
-        args = ['qemu-%s-static' % qemu_arch, '-g', str(qemu_port)] + args
+        args = [get_qemu_user(), '-g', str(qemu_port)] + args
 
-    if not ssh:
-        runner  = tubes.process.process
-        which   = misc.which
-    if ssh:
-        runner  = ssh.run
-        which   = ssh.which
-
-    # Make sure gdbserver is installed
+    # Make sure gdbserver/qemu is installed
     if not which(args[0]):
         log.error("%s is not installed" % args[0])
 
-    with context.local(log_level='debug'):
-        gdbserver = runner(args)
+    exe = exe or which(orig_args[0])
+    if not exe:
+        log.error("%s does not exist" % orig_args[0])
 
-    if not arch:
-        # Process /bin/bash created; pid = 14366
-        # Listening on port 34816
-        process_created = gdbserver.recvline()
-        listening_on    = gdbserver.recvline()
+    # Start gdbserver/qemu
+    # (Note: We override ASLR here for the gdbserver process itself.)
+    gdbserver = runner(args, env=env, aslr=1, **kwargs)
 
-        port = int(listening_on.split()[-1])
+    # Set the .executable on the process object.
+    gdbserver.executable = which(orig_args[0])
+
+    # Find what port we need to connect to
+    if context.native or (context.os == 'android'):
+        port = _gdbserver_port(gdbserver, ssh)
     else:
         port = qemu_port
 
-    listener = remote = None
+    host = '127.0.0.1'
+    if not ssh and context.os == 'android':
+        host = context.adb_host
 
-    if ssh:
-        remote   = ssh.connect_remote('127.0.0.1', port)
-        listener = tubes.listen.listen(0)
-        port     = listener.lport
-    elif not exe:
-        exe = misc.which(orig_args[0])
+    attach((host, port), exe=exe, gdbscript=gdbscript, need_ptrace_scope = False, ssh=ssh)
 
-    attach(('127.0.0.1', port), exe=orig_args[0], execute=execute, arch=context.arch)
+    # gdbserver outputs a message when a client connects
+    garbage = gdbserver.recvline(timeout=1)
 
-    if ssh:
-        remote <> listener.wait_for_connection()
+    if "Remote debugging from host" not in garbage:
+        gdbserver.unrecv(garbage)
 
     return gdbserver
 
-def get_gdb_arch(arch):
+def get_gdb_arch():
     return {
         'amd64': 'i386:x86-64',
-        'powerpc': 'powerpc:403',
-        'powerpc64': 'powerpc:e5500'
-    }.get(arch, arch)
+        'powerpc': 'powerpc:common',
+        'powerpc64': 'powerpc:common64',
+        'mips64': 'mips:isa64',
+        'thumb': 'arm'
+    }.get(context.arch, context.arch)
 
-
-def attach(target, execute = None, exe = None, arch = None):
-    """attach(target, execute = None, exe = None, arch = None) -> None
-
-    Start GDB in a new terminal and attach to `target`.
-    :func:`pwnlib.util.proc.pidof` is used to find the PID of `target` except
-    when `target` is a ``(host, port)``-pair.  In that case `target` is assumed
-    to be a GDB server.
-
-    If it is running locally and `exe` is not given we will try to find the path
-    of the target binary from parsing the command line of the program running
-    the GDB server (e.g. qemu or gdbserver).  Notice that if the PID is known
-    (when `target` is not a GDB server) `exe` will be read from
-    ``/proc/<pid>/exe``.
-
-    If `gdb-multiarch` is installed we use that or 'gdb' otherwise.
-
-    Arguments:
-      target: The target to attach to.
-      execute (str or file): GDB script to run after attaching.
-      exe (str): The path of the target binary.
-      arch (str): Architechture of the target binary.  If `exe` known GDB will
-      detect the architechture automatically (if it is supported).
+def binary():
+    """binary() -> str
 
     Returns:
-      :const:`None`
-"""
-    # if ptrace_scope is set and we're not root, we cannot attach to a running process
-    try:
-        ptrace_scope = open('/proc/sys/kernel/yama/ptrace_scope').read().strip()
-        if ptrace_scope != '0' and os.geteuid() != 0:
-            msg =  'Disable ptrace_scope to attach to running processes.\n'
-            msg += 'More info: https://askubuntu.com/q/41629'
-            log.warning(msg)
-            return
-    except IOError:
-        pass
+        str: Path to the appropriate ``gdb`` binary to use.
+    """
+    gdb = misc.which('gdb')
 
-    # if execute is a file object, then read it; we probably need to run some
+    if not context.native:
+        multiarch = misc.which('gdb-multiarch')
+
+        if multiarch:
+            return multiarch
+        log.warn_once('Cross-architecture debugging usually requires gdb-multiarch\n' \
+                      '$ apt-get install gdb-multiarch')
+
+    if not gdb:
+        log.error('GDB is not installed\n'
+                  '$ apt-get install gdb')
+
+    return gdb
+
+@LocalContext
+def attach(target, gdbscript = None, exe = None, need_ptrace_scope = True, gdb_args = None, ssh = None):
+    """attach(target, gdbscript = None, exe = None, arch = None, ssh = None) -> None
+
+    Start GDB in a new terminal and attach to `target`.
+
+    Arguments:
+        target: The target to attach to.
+        gdbscript(:obj:`str` or :obj:`file`): GDB script to run after attaching.
+        exe(str): The path of the target binary.
+        arch(str): Architechture of the target binary.  If `exe` known GDB will
+          detect the architechture automatically (if it is supported).
+        gdb_args(list): List of additional arguments to pass to GDB.
+
+    Returns:
+        PID of the GDB process (or the window which it is running in).
+
+    Notes:
+
+        The ``target`` argument is very robust, and can be any of the following:
+
+        :obj:`int`
+            PID of a process
+        :obj:`str`
+            Process name.  The youngest process is selected.
+        :obj:`tuple`
+            Host, port pair of a listening ``gdbserver``
+        :class:`.process`
+            Process to connect to
+        :class:`.sock`
+            Connected socket. The executable on the other end of the connection is attached to.
+            Can be any socket type, including :class:`.listen` or :class:`.remote`.
+        :class:`.ssh_channel`
+            Remote process spawned via :meth:`.ssh.process`.
+            This will use the GDB installed on the remote machine.
+            If a password is required to connect, the ``sshpass`` program must be installed.
+
+        .. code-block:: python
+
+            # Attach directly to pid 1234
+            gdb.attach(1234)
+
+        .. code-block:: python
+
+            # Attach to the youngest "bash" process
+            gdb.attach('bash')
+
+        .. code-block:: python
+
+            # Start a process
+            bash = process('bash')
+
+            # Attach the debugger
+            gdb.attach(bash, '''
+            set follow-fork-mode child
+            break execve
+            continue
+            ''')
+
+            # Interact with the process
+            bash.sendline('whoami')
+
+        .. code-block:: python
+
+            # Start a forking server
+            server = process(['socat', 'tcp-listen:1234,fork,reuseaddr', 'exec:/bin/sh'])
+
+            # Connect to the server
+            io = remote('localhost', 1234)
+
+            # Connect the debugger to the server-spawned process
+            gdb.attach(io, '''
+            break exit
+            continue
+            ''')
+
+            # Talk to the spawned 'sh'
+            io.sendline('exit')
+
+        .. code-block:: python
+
+            # Connect to the SSH server
+            shell = ssh('bandit0', 'bandit.labs.overthewire.org', password='bandit0', port=2220)
+
+            # Start a process on the server
+            cat = shell.process(['cat'])
+
+            # Attach a debugger to it
+            gdb.attach(cat, '''
+            break exit
+            continue
+            ''')
+
+            # Cause `cat` to exit
+            cat.close()
+    """
+    if context.noptrace:
+        log.warn_once("Skipping debug attach since context.noptrace==True")
+        return
+
+    # if gdbscript is a file object, then read it; we probably need to run some
     # more gdb script anyway
-    if execute:
-        if isinstance(execute, file):
-            fd = execute
-            execute = fd.read()
-            fd.close()
+    if isinstance(gdbscript, file):
+        with gdbscript:
+            gdbscript = gdbscript.read()
 
     # enable gdb.attach(p, 'continue')
-    if execute and not execute.endswith('\n'):
-        execute += '\n'
+    if gdbscript and not gdbscript.endswith('\n'):
+        gdbscript += '\n'
 
-    # gdb script to run before `execute`
+    # gdb script to run before `gdbscript`
     pre = ''
-    if arch:
-        if not misc.which('gdb-multiarch'):
-            log.warn_once('Cross-architecture debugging usually requires gdb-multiarch\n' \
-                '$ apt-get install gdb-multiarch')
+    if not context.native:
         pre += 'set endian %s\n' % context.endian
-        pre += 'set architecture %s\n' % get_gdb_arch(arch)
+        pre += 'set architecture %s\n' % get_gdb_arch()
+
+        if context.os == 'android':
+            pre += 'set gnutarget ' + _bfdname() + '\n'
 
     # let's see if we can find a pid to attach to
     pid = None
@@ -187,11 +568,16 @@ def attach(target, execute = None, exe = None, arch = None):
         pid = target
     elif isinstance(target, str):
         # pidof picks the youngest process
-        pids = proc.pidof(target)
+        pidof = proc.pidof
+
+        if context.os == 'android':
+            pidof = adb.pidof
+
+        pids = pidof(target)
         if not pids:
-            log.error('no such process: %s' % target)
+            log.error('No such process: %s' % target)
         pid = pids[0]
-        log.info('attaching you youngest process "%s" (PID = %d)' %
+        log.info('Attaching to youngest process "%s" (PID = %d)' %
                  (target, pid))
     elif isinstance(target, tubes.ssh.ssh_channel):
         if not target.pid:
@@ -200,14 +586,19 @@ def attach(target, execute = None, exe = None, arch = None):
         shell = target.parent
 
         tmpfile = shell.mktemp()
-        shell.upload_data(execute or '', tmpfile)
+        gdbscript = 'shell rm %s\n%s' % (tmpfile, gdbscript)
+        shell.upload_data(gdbscript or '', tmpfile)
 
-        cmd = ['ssh', '-t', '-p', str(shell.port), '-l', shell.user, shell.host]
+        cmd = ['ssh', '-C', '-t', '-p', str(shell.port), '-l', shell.user, shell.host]
         if shell.password:
+            if not misc.which('sshpass'):
+                log.error("sshpass must be installed to debug ssh processes")
             cmd = ['sshpass', '-p', shell.password] + cmd
         if shell.keyfile:
             cmd += ['-i', shell.keyfile]
-        cmd += ['gdb %r %s -x "%s" ; rm "%s"' % (target.exe, target.pid, tmpfile, tmpfile)]
+        cmd += ['gdb -q %r %s -x "%s"' % (target.executable,
+                                       target.pid,
+                                       tmpfile)]
 
         misc.run_in_new_terminal(' '.join(cmd))
         return
@@ -223,111 +614,94 @@ def attach(target, execute = None, exe = None, arch = None):
     elif isinstance(target, tuple) and len(target) == 2:
         host, port = target
         pre += 'target remote %s:%d\n' % (host, port)
+
         def findexe():
-            # hm no PID then, but wait! we might not be totally out of luck yet: if
-            # the gdbserver is running locally and we know the program who is
-            # hosting it (e.g qemu, gdbserver) we can figure out the `exe` from the
-            # command line
-
-            # find inode of the listen socket
-            inode = None
-
-            # XXX: do a proper check to see if we're hosting the server
-            if host not in ('localhost', '127.0.0.1', '0.0.0.0',
-                            '::1', 'ip6-localhost', '::'):
-                return
-
-            for f in ['tcp', 'tcp6']:
-                with open('/proc/net/%s' % f) as fd:
-                    # skip the first line with the column names
-                    fd.readline()
-                    for line in fd:
-                        line = line.split()
-                        loc = line[1]
-                        lport = int(loc.split(':')[1], 16)
-                        st = int(line[3], 16)
-                        if st != 10: # TCP_LISTEN, see include/net/tcp_states.h
-                            continue
-                        if lport == port:
-                            inode = int(line[9])
-                            break
-                if inode:
-                    break
-
-            # if we didn't find the inode, there's nothing we can do about it
-            if not inode:
-                return
-
-            # find the process who owns the socket
-            spid = proc.pid_by_inode(inode)
-            if not spid:
-                return
-
-            # let's have a look at the server exe
-            sexe = proc.exe(spid)
-            name = os.path.basename(sexe)
-            # XXX: parse cmdline
-            if name.startswith('qemu-') or name.startswith('gdbserver'):
-                exe = proc.cmdline(spid)[-1]
-                return os.path.join(proc.cwd(spid), exe)
+            for spid in proc.pidof(target):
+                sexe = proc.exe(spid)
+                name = os.path.basename(sexe)
+                # XXX: parse cmdline
+                if name.startswith('qemu-') or name.startswith('gdbserver'):
+                    exe = proc.cmdline(spid)[-1]
+                    return os.path.join(proc.cwd(spid), exe)
 
         exe = exe or findexe()
+    elif isinstance(target, elf.corefile.Corefile):
+        pre += 'target core %s\n' % target.path
     else:
         log.error("don't know how to attach to target: %r" % target)
 
     # if we have a pid but no exe, just look it up in /proc/
     if pid and not exe:
-        exe = proc.exe(pid)
+        exe_fn = proc.exe
+        if context.os == 'android':
+            exe_fn = adb.proc_exe
+        exe = exe_fn(pid)
 
     if not pid and not exe:
         log.error('could not find target process')
 
-    cmd = None
-    for p in ('gdb-multiarch', 'gdb'):
-        if misc.which(p):
-            cmd = p
-            break
+    cmd = binary()
 
-    if not cmd:
-        log.error('no gdb installed')
+    if gdb_args:
+        cmd += ' '
+        cmd += ' '.join(gdb_args)
 
-    if exe:
+    cmd += ' -q '
+
+    if exe and context.native:
+        if ssh:
+            ssh.download_file(exe)
+            exe = os.path.basename(exe)
         if not os.path.isfile(exe):
-            log.error('no such file: %s' % exe)
+            log.error('No such file: %s' % exe)
         cmd += ' "%s"' % exe
 
-    if pid:
+    if pid and not context.os == 'android':
         cmd += ' %d' % pid
 
-    execute = pre + (execute or '')
+    if context.os == 'android' and pid:
+        runner  = _get_runner()
+        which   = _get_which()
+        gdb_cmd = _gdbserver_args(pid=pid, which=which)
+        gdbserver = runner(gdb_cmd)
+        port    = _gdbserver_port(gdbserver, None)
+        host    = context.adb_host
+        pre    += 'target remote %s:%i' % (context.adb_host, port)
 
-    if execute:
+    gdbscript = pre + (gdbscript or '')
+
+    if gdbscript:
         tmp = tempfile.NamedTemporaryFile(prefix = 'pwn', suffix = '.gdb',
                                           delete = False)
-        tmp.write(execute)
+        log.debug('Wrote gdb script to %r\n%s' % (tmp.name, gdbscript))
+        gdbscript = 'shell rm %s\n%s' % (tmp.name, gdbscript)
+
+        tmp.write(gdbscript)
         tmp.close()
-        atexit.register(lambda: os.unlink(tmp.name))
-        cmd += ' -x "%s" ; rm "%s"' % (tmp.name, tmp.name)
+        cmd += ' -x "%s"' % (tmp.name)
 
     log.info('running in new terminal: %s' % cmd)
-    misc.run_in_new_terminal(cmd)
-    if pid:
+
+    gdb_pid = misc.run_in_new_terminal(cmd)
+
+    if pid and context.native:
         proc.wait_for_debugger(pid)
 
-def ssh_gdb(ssh, process, execute = None, arch = None, **kwargs):
-    if isinstance(process, (list, tuple)):
-        exe = process[0]
-        process = ["gdbserver", "127.0.0.1:0"] + process
-    else:
-        exe = process
-        process = "gdbserver 127.0.0.1:0 " + process
+    return gdb_pid
+
+def ssh_gdb(ssh, argv, gdbscript = None, arch = None, **kwargs):
+    if not isinstance(argv, (list, tuple)):
+        argv = [argv]
+
+    exe = argv[0]
+    argv = ["gdbserver", "127.0.0.1:0"] + argv
 
     # Download the executable
     local_exe = os.path.basename(exe)
-    ssh.download_file(exe, local_exe)
+    ssh.download_file(ssh.which(exe), local_exe)
 
     # Run the process
-    c = ssh.run(process, **kwargs)
+    c = ssh.process(argv, **kwargs)
 
     # Find the port for the gdb server
     c.recvuntil('port ')
@@ -339,7 +713,7 @@ def ssh_gdb(ssh, process, execute = None, arch = None, **kwargs):
     l = tubes.listen.listen(0)
     forwardport = l.lport
 
-    attach(('127.0.0.1', forwardport), execute, local_exe, arch)
+    attach(('127.0.0.1', forwardport), gdbscript, local_exe, arch, ssh=ssh)
     l.wait_for_connection() <> ssh.connect_remote('127.0.0.1', gdbport)
     return c
 
@@ -380,8 +754,8 @@ def find_module_addresses(binary, ssh=None, ulimit=False):
     Arguments:
         binary(str): Path to the binary on the remote server
         ssh(pwnlib.tubes.tube): SSH connection through which to load the libraries.
-            If left as ``None``, will use a ``pwnlib.tubes.process.process``.
-        ulimit(bool): Set to ``True`` to run "ulimit -s unlimited" before GDB.
+            If left as :const:`None`, will use a :class:`pwnlib.tubes.process.process`.
+        ulimit(bool): Set to :const:`True` to run "ulimit -s unlimited" before GDB.
 
     Returns:
         A list of pwnlib.elf.ELF objects, with correct base addresses.
@@ -389,7 +763,7 @@ def find_module_addresses(binary, ssh=None, ulimit=False):
     Example:
 
     >>> with context.local(log_level=9999): # doctest: +SKIP
-    ...     shell = ssh(host='bandit.labs.overthewire.org',user='bandit0',password='bandit0')
+    ...     shell = ssh(host='bandit.labs.overthewire.org',user='bandit0',password='bandit0', port=2220)
     ...     bash_libs = gdb.find_module_addresses('/bin/bash', shell)
     >>> os.path.basename(bash_libs[0].path) # doctest: +SKIP
     'libc.so.6'
@@ -416,7 +790,7 @@ def find_module_addresses(binary, ssh=None, ulimit=False):
     # Get the addresses from GDB
     #
     libs = {}
-    cmd  = "gdb --args %s" % (binary)
+    cmd  = "gdb -q --args %s" % (binary)
     expr = re.compile(r'(0x\S+)[^/]+(.*)')
 
     if ulimit:
@@ -425,9 +799,10 @@ def find_module_addresses(binary, ssh=None, ulimit=False):
     cmd = shlex.split(cmd)
 
     with runner(cmd) as gdb:
+        if context.aslr:
+            gdb.sendline('set disable-randomization off')
         gdb.send("""
         set prompt
-        set disable-randomization off
         break *%#x
         run
         """ % entry)
@@ -467,3 +842,71 @@ def find_module_addresses(binary, ssh=None, ulimit=False):
         rv.append(lib)
 
     return rv
+
+def corefile(process):
+    r"""Drops a core file for the process.
+
+    Arguments:
+        process: Process to dump
+
+    Returns:
+        :class:`.Core`: The generated core file
+    """
+
+    if context.noptrace:
+        log.warn_once("Skipping corefile since context.noptrace==True")
+        return
+
+    corefile_path = './core.%s.%i' % (os.path.basename(process.executable),
+                                    process.pid)
+
+    # Due to https://sourceware.org/bugzilla/show_bug.cgi?id=16092
+    # will disregard coredump_filter, and will not dump private mappings.
+    if version() < (7,11):
+        log.warn_once('The installed GDB (%s) does not emit core-dumps which '
+                      'contain all of the data in the process.\n'
+                      'Upgrade to GDB >= 7.11 for better core-dumps.' % binary())
+
+    # This is effectively the same as what the 'gcore' binary does
+    gdb_args = ['-batch',
+                '-q',
+                '--nx',
+                '-ex', '"set pagination off"',
+                '-ex', '"set height 0"',
+                '-ex', '"set width 0"',
+                '-ex', '"set use-coredump-filter on"',
+                '-ex', '"generate-core-file %s"' % corefile_path,
+                '-ex', 'detach']
+
+    with context.local(terminal = ['sh', '-c']):
+        with context.quiet:
+            pid = attach(process, gdb_args=gdb_args)
+            os.waitpid(pid, 0)
+
+    return elf.corefile.Core(corefile_path)
+
+def version(program='gdb'):
+    """Gets the current GDB version.
+
+    Note:
+        Requires that GDB version meets the following format:
+
+        ``GNU gdb (GDB) 7.12``
+
+    Returns:
+        tuple: A tuple containing the version numbers
+
+    Example:
+
+        >>> (7,0) <= gdb.version() <= (8,0)
+        True
+    """
+    program = misc.which(program)
+    expr = r'([0-9]+\.?)+'
+
+    with tubes.process.process([program, '--version'], level='error') as gdb:
+        version = gdb.recvline()
+
+    versions = re.search(expr, version).group()
+
+    return tuple(map(int, versions.split('.')))

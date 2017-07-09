@@ -1,36 +1,43 @@
+from __future__ import absolute_import
+
+import glob
+import platform
 import sys
 import time
 
 import serial
 
-from . import tube
-from .. import context
-from .. import term
-from ..log import getLogger
+from pwnlib.log import getLogger
+from pwnlib.tubes import tube
 
 log = getLogger(__name__)
 
 class serialtube(tube.tube):
     def __init__(
-            self, port = '/dev/ttyUSB0', baudrate = 115200,
+            self, port = None, baudrate = 115200,
             convert_newlines = True,
             bytesize = 8, parity='N', stopbits=1, xonxoff = False,
-            rtscts = False, dsrdtr = False,
-            timeout = 'default'):
-        super(serialtube, self).__init__(timeout)
+            rtscts = False, dsrdtr = False, *a, **kw):
+        super(serialtube, self).__init__(*a, **kw)
+
+        if port is None:
+            if platform.system() == 'Darwin':
+                port = glob.glob('/dev/tty.usbserial*')[0]
+            else:
+                port = '/dev/ttyUSB0'
 
         self.convert_newlines = convert_newlines
         self.conn = serial.Serial(
             port = port,
             baudrate = baudrate,
-            bytesize = 8,
-            parity = 'N',
-            stopbits = 1,
+            bytesize = bytesize,
+            parity = parity,
+            stopbits = stopbits,
             timeout = 0,
-            xonxoff = False,
-            rtscts = False,
+            xonxoff = xonxoff,
+            rtscts = rtscts,
             writeTimeout = None,
-            dsrdtr = False,
+            dsrdtr = dsrdtr,
             interCharTimeout = 0
         )
 
@@ -39,21 +46,14 @@ class serialtube(tube.tube):
         if not self.conn:
             raise EOFError
 
-        if self.timeout == None:
-            end = float('inf')
-        else:
-            end = time.time() + self.timeout
+        with self.countdown():
+            while self.conn and self.countdown_active():
+                data = self.conn.read(numb)
 
-        while True:
-            data = self.conn.read(numb)
-            if data:
-                return data
+                if data:
+                    return data
 
-            delta = end - time.time()
-            if delta <= 0:
-                break
-            else:
-                time.sleep(min(delta, 0.1))
+                time.sleep(min(self.timeout, 0.1))
 
         return None
 
@@ -73,10 +73,11 @@ class serialtube(tube.tube):
         pass
 
     def can_recv_raw(self, timeout):
-        end = time.time()
-        while time.time() < end:
-            if self.conn.inWaiting():
-                return True
+        with self.countdown(timeout):
+            while self.conn and self.countdown_active():
+                if self.conn.inWaiting():
+                    return True
+                time.sleep(min(self.timeout, 0.1))
         return False
 
     def connected_raw(self, direction):
@@ -89,61 +90,9 @@ class serialtube(tube.tube):
 
     def fileno(self):
         if not self.connected():
-            log.error("A stopped program does not have a file number")
+            self.error("A closed serialtube does not have a file number")
 
         return self.conn.fileno()
 
     def shutdown_raw(self, direction):
         self.close()
-
-    def interactive(self, prompt = term.text.bold_red('$') + ' '):
-        log.info('Switching to interactive mode')
-
-        # We would like a cursor, please!
-        term.term.show_cursor()
-
-        go = [True]
-        def recv_thread(go):
-            while go[0]:
-                try:
-                    cur = self.recv(timeout = 0.05)
-                    if cur == None:
-                        continue
-                    elif cur == '\a':
-                        # Ugly hack until term unstands bell characters
-                        continue
-                    sys.stderr.write(cur)
-                    sys.stderr.flush()
-                except EOFError:
-                    log.info('Got EOF while reading in interactive')
-                    go[0] = False
-                    break
-
-        t = context.Thread(target = recv_thread, args = (go,))
-        t.daemon = True
-        t.start()
-
-        while go[0]:
-            if term.term_mode:
-                try:
-                    data = term.key.getraw(0.1)
-                except IOError:
-                    if go[0]:
-                        raise
-            else:
-                data = sys.stdin.read(1)
-                if not data:
-                    go[0] = False
-
-            if data:
-                try:
-                    self.send(''.join(chr(c) for c in data))
-                except EOFError:
-                    go[0] = False
-                    log.info('Got EOF while sending in interactive')
-
-        while t.is_alive():
-            t.join(timeout = 0.1)
-
-        # Restore
-        term.term.hide_cursor()

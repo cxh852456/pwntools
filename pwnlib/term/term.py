@@ -1,14 +1,4 @@
-__all__ = ['output', 'init']
-
-# we assume no terminal can display more lines than this
-MAX_TERM_HEIGHT = 200
-
-# default values
-width = 80
-height = 25
-
-# list of callbacks triggered on SIGWINCH
-on_winch = []
+from __future__ import absolute_import
 
 import atexit
 import fcntl
@@ -21,12 +11,27 @@ import termios
 import threading
 import traceback
 
-from . import termcap
+from pwnlib.context import ContextType
+from pwnlib.term import termcap
+
+__all__ = ['output', 'init']
+
+# we assume no terminal can display more lines than this
+MAX_TERM_HEIGHT = 200
+
+# default values
+width = 80
+height = 25
+
+# list of callbacks triggered on SIGWINCH
+on_winch = []
+
+
 
 settings = None
 _graphics_mode = False
 
-fd = sys.stderr
+fd = sys.stdout
 
 def show_cursor():
     do('cnorm')
@@ -127,6 +132,11 @@ def init():
         sys.stdout = Wrapper(sys.stdout)
     if sys.stderr.isatty():
         sys.stderr = Wrapper(sys.stderr)
+
+    console = ContextType.defaults['log_console']
+    if console.isatty():
+        ContextType.defaults['log_console'] = Wrapper(console)
+
     # freeze all cells if an exception is thrown
     orig_hook = sys.excepthook
     def hook(*args):
@@ -265,10 +275,10 @@ def parse(s):
                 #  related: https://unix.stackexchange.com/questions/5936/can-i-set-my-local-machines-terminal-colors-to-use-those-of-the-machine-i-ssh-i
                 try:
                     j = s.index('\x07', i)
-                except:
+                except Exception:
                     try:
                         j = s.index('\x1b\\', i)
-                    except:
+                    except Exception:
                         j = 1
                 x = (OOB, s[i:j + 1])
                 i = j + 1

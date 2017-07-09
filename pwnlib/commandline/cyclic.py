@@ -1,19 +1,19 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
+
 import argparse
 import string
 import sys
 
-from pwnlib.log import getLogger
-from pwnlib.log import install_default_handler
-from pwnlib.util import cyclic
-from pwnlib.util import packing
+import pwnlib
+pwnlib.args.free_form = False
 
-install_default_handler()
+from pwn import *
+from pwnlib.commandline import common
 
-log = getLogger('pwnlib.commandline.cyclic')
-
-parser = argparse.ArgumentParser(
-    description = "Cyclic pattern creator/finder"
+parser = common.parser_commands.add_parser(
+    'cyclic',
+    help = "Cyclic pattern creator/finder"
 )
 
 parser.add_argument(
@@ -31,11 +31,20 @@ parser.add_argument(
     help = 'Size of the unique subsequences (defaults to 4).'
 )
 
+parser.add_argument(
+    '-c', '--context',
+    metavar = 'context',
+    action = 'append',
+    type   = common.context_arg,
+    choices = common.choices,
+    help = 'The os/architecture/endianness/bits the shellcode will run in (default: linux/i386), choose from: %s' % common.choices,
+)
+
 group = parser.add_mutually_exclusive_group(required = True)
 group.add_argument(
     '-l', '-o', '--offset', '--lookup',
     dest = 'lookup',
-    metavar = '<lookup value>',
+    metavar = 'lookup_value',
     help = 'Do a lookup instead printing the alphabet',
 )
 
@@ -46,18 +55,17 @@ group.add_argument(
     help = 'Number of characters to print'
 )
 
-def main():
-    args = parser.parse_args()
+def main(args):
     alphabet = args.alphabet
     subsize  = args.length
 
     if args.lookup:
         pat = args.lookup
 
-        if pat.startswith('0x'):
-            pat = packing.pack(int(pat[2:], 16), subsize*8, 'little', False)
-        elif pat.isdigit():
-            pat = packing.pack(int(pat, 10), subsize*8, 'little', False)
+        try:
+            pat = packing.pack(int(pat, 0), subsize*8)
+        except ValueError:
+            pass
 
         if len(pat) != subsize:
             log.critical('Subpattern must be %d bytes' % subsize)
@@ -67,7 +75,7 @@ def main():
             log.critical('Pattern contains characters not present in the alphabet')
             sys.exit(1)
 
-        offset = cyclic.cyclic_find(pat, alphabet, subsize)
+        offset = cyclic_find(pat, alphabet, subsize)
 
         if offset == -1:
             log.critical('Given pattern does not exist in cyclic pattern')
@@ -76,7 +84,7 @@ def main():
             print offset
     else:
         want   = args.count
-        result = cyclic.cyclic(want, alphabet, subsize)
+        result = cyclic(want, alphabet, subsize)
         got    = len(result)
         if got < want:
             log.failure("Alphabet too small (max length = %i)" % got)
@@ -86,4 +94,5 @@ def main():
         if sys.stdout.isatty():
             sys.stdout.write('\n')
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    pwnlib.commandline.common.main(__file__)

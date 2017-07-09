@@ -11,7 +11,10 @@ Building `binutils` from source takes about 60 seconds on a modern 8-core machin
 
 Ubuntu
 ^^^^^^^^^^^^^^^^
-First, add our `Personal Package Archive repository <http://binutils.pwntools.com>`__.
+
+For Ubuntu 12.04 through 15.10, you must first add the pwntools `Personal Package Archive repository <http://binutils.pwntools.com>`__.
+
+Ubuntu Xenial (16.04) has official packages for most architectures, and does not require this step.
 
 .. code-block:: bash
 
@@ -58,8 +61,6 @@ OSes, ``binutils`` is simple to build by hand.
     gpg --keyserver keys.gnupg.net --recv-keys 4AE55E93
     gpg --verify binutils-$V.tar.gz.sig
 
-    rm -rf binutils-*
-
     tar xf binutils-$V.tar.gz
 
     mkdir binutils-build
@@ -79,6 +80,6 @@ OSes, ``binutils`` is simple to build by hand.
     MAKE=gmake
     hash gmake || MAKE=make
 
-    $MAKE -j
+    $MAKE -j clean all
     sudo $MAKE install
 

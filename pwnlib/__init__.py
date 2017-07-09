@@ -1,17 +1,22 @@
+from __future__ import absolute_import
+
 import importlib
 
-from .version import __version__
+from pwnlib.version import __version__
 
 version = __version__
 
 __all__ = [
+    'args',
     'asm',
     'atexception',
     'atexit',
     'commandline',
     'constants',
     'context',
+    'data',
     'dynelf',
+    'encoders',
     'elf',
     'exception',
     'fmtstr',
@@ -23,12 +28,15 @@ __all__ = [
     'regsort',
     'replacements',
     'rop',
+    'runner',
     'shellcraft',
     'term',
     'tubes',
     'ui',
     'useragents',
-    'util'
+    'util',
+    'adb',
+    'update',
 ]
 
 for module in __all__:

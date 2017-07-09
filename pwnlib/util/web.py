@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+
 import os
 import tempfile
 
-from ..log import getLogger
-from .misc import size
+from pwnlib.log import getLogger
+from pwnlib.tubes.buffer import Buffer
+from pwnlib.util.misc import size
 
 log = getLogger(__name__)
 
@@ -21,21 +24,19 @@ def wget(url, save=None, timeout=5, **kwargs):
     Example:
 
       >>> url    = 'https://httpbin.org/robots.txt'
-      >>> with context.local(log_level='ERROR'):
-      ...     result = wget(url)
+      >>> result = wget(url, timeout=60)
       >>> result
       'User-agent: *\\nDisallow: /deny\\n'
-      >>> with context.local(log_level='ERROR'):
-      ...     _ = wget(url, True)
+      >>> result2 = wget(url, True, timeout=60)
       >>> result == file('robots.txt').read()
       True
     """
     import requests
 
-    with log.progress("Downloading '%s'" % url) as w:
+    with log.progress("Downloading '%s'" % url, rate=0.1) as w:
         w.status("Making request...")
 
-        response = requests.get(url, stream=True, **kwargs)
+        response = requests.get(url, stream=True, timeout=timeout, **kwargs)
 
         if not response.ok:
             w.failure("Got code %s" % response.status_code)
@@ -51,15 +52,17 @@ def wget(url, save=None, timeout=5, **kwargs):
             chunk_size *= 1000
 
         # Count chunks as they're received
-        total_data    = ''
+        buf = Buffer()
 
         # Loop until we have all of the data
         for chunk in response.iter_content(chunk_size = 2**10):
-            total_data    += chunk
+            buf.add(chunk)
             if total_size:
-                w.status('%s / %s' % (size(total_data), size(total_size)))
+                w.status('%s / %s' % (size(buf.size), size(total_size)))
             else:
-                w.status('%s' % size(total_data))
+                w.status('%s' % size(buf.size))
+
+        total_data = buf.get()
 
         # Save to the target file if provided
         if save:

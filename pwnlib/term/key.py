@@ -1,4 +1,4 @@
-__all__ = ['getch', 'getraw', 'get', 'unget']
+from __future__ import absolute_import
 
 import errno
 import os
@@ -6,11 +6,17 @@ import select
 import string
 import sys
 
-from . import keyconsts as kc
-from . import termcap
+from pwnlib.term import keyconsts as kc
+from pwnlib.term import termcap
+
+__all__ = ['getch', 'getraw', 'get', 'unget']
+
+# When set, convert keypad codes into regular key presses, e.g. "+" instead of
+# `<kp plus>`
+FLAG_CONVERTKP = True
 
 try:    _fd = sys.stdin.fileno()
-except: _fd = file('/dev/null', 'r').fileno()
+except Exception: _fd = file('/dev/null', 'r').fileno()
 
 def getch(timeout = 0):
     while True:
@@ -306,7 +312,24 @@ _csi_ss3s = {
 }
 
 _csi_ss3kp = {
-
+    'M': (kc.TYPE_KEYSYM, kc.KEY_KPENTER , None),
+    'X': (kc.TYPE_KEYSYM, kc.KEY_KPEQUALS, '='),
+    'j': (kc.TYPE_KEYSYM, kc.KEY_KPMULT  , '*'),
+    'k': (kc.TYPE_KEYSYM, kc.KEY_KPPLUS  , '+'),
+    'l': (kc.TYPE_KEYSYM, kc.KEY_KPCOMMA , ','),
+    'm': (kc.TYPE_KEYSYM, kc.KEY_KPMINUS , '-'),
+    'n': (kc.TYPE_KEYSYM, kc.KEY_KPPERIOD, '.'),
+    'o': (kc.TYPE_KEYSYM, kc.KEY_KPDIV   , '/'),
+    'p': (kc.TYPE_KEYSYM, kc.KEY_KP0     , '0'),
+    'q': (kc.TYPE_KEYSYM, kc.KEY_KP1     , '1'),
+    'r': (kc.TYPE_KEYSYM, kc.KEY_KP2     , '2'),
+    's': (kc.TYPE_KEYSYM, kc.KEY_KP3     , '3'),
+    't': (kc.TYPE_KEYSYM, kc.KEY_KP4     , '4'),
+    'u': (kc.TYPE_KEYSYM, kc.KEY_KP5     , '5'),
+    'v': (kc.TYPE_KEYSYM, kc.KEY_KP6     , '6'),
+    'w': (kc.TYPE_KEYSYM, kc.KEY_KP7     , '7'),
+    'x': (kc.TYPE_KEYSYM, kc.KEY_KP8     , '8'),
+    'y': (kc.TYPE_KEYSYM, kc.KEY_KP9     , '9'),
 }
 
 _csi_funcs = {
@@ -369,14 +392,14 @@ def _peekkey_ss3(offset):
     cmd = _cbuf[offset]
     if cmd < 0x40 or cmd >= 0x80:
         return
-    _cbuf = _cbuf[numb:] # XXX: numb is not defined
+    _cbuf = _cbuf[offset:]
 
     if chr(cmd) in _csi_ss3s:
         return Key(*_csi_ss3s[chr(cmd)])
 
     if chr(cmd) in _csi_ss3kp:
         t, c, a = _csi_ss3kp[chr(cmd)]
-        if CONVERTKP and a: # XXX: CONVERTKP is not defined
+        if FLAG_CONVERTKP and a:
             return Key(kc.TYPE_UNICODE, a)
         else:
             return Key(t, c)
